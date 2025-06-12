@@ -1,5 +1,3 @@
-Here's a GitHub README for your Slab Allocator project:
-
 # Slab Allocator
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/IMSDcrueoft/Slab-Allocator)
 
