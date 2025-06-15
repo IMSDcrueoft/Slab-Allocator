@@ -36,12 +36,10 @@ namespace slab {
 			uint32_t offset;			// the offset to SlabBlock
 			char payload[];
 
-			SlabUnit(const uint32_t index, const uint32_t offset) {
-				this->index = index;
-				this->offset = offset;
+			static void construct(SlabUnit* _this, const uint32_t index, const uint32_t offset) {
+				_this->index = index;
+				_this->offset = offset;
 			}
-
-			//no destructor, and no need to free memory
 
 			static SlabUnit* getUnitFromPayload(const void* ptr) {
 				return (SlabUnit*)((char*)ptr - OFFSET_OF(SlabUnit, payload));
@@ -55,22 +53,26 @@ namespace slab {
 			uint64_t bitMap;			// bit==1 means free (bitMap != 0)
 			char payload[];				// the slices
 
-			SlabBlock(const SlabAllocator* allocator) {
+			static void construct(SlabBlock* _this, const SlabAllocator* allocator) {
 				// Calculate the offset of the 'payload' flexible array member in SlabBlock.
 				// Allocate memory for the fixed part of the structure plus space for 64 units of metadata.
 				// This ensures the flexible array can be used safely without additional allocations.
 				constexpr size_t baseOffset = OFFSET_OF(SlabBlock, payload);
 
-				this->allocator = const_cast<SlabAllocator*>(allocator); // set allocator pointer
-				this->prev = nullptr;
-				this->next = nullptr;
-				this->bitMap = UINT64_MAX; // all free
+				_this->allocator = const_cast<SlabAllocator*>(allocator); // set allocator pointer
+				_this->prev = nullptr;
+				_this->next = nullptr;
+				_this->bitMap = UINT64_MAX; // all free
 
 				for (size_t i = 0; i < 64; ++i) {
 					const auto currentOffset = baseOffset + i * allocator->unitMetaSize;
-					SlabUnit* unit = (SlabUnit*)(reinterpret_cast<char*>(this) + currentOffset);
-					new (unit) SlabUnit(i, currentOffset); // placement new to initialize the unit
+					SlabUnit* unit = (SlabUnit*)(reinterpret_cast<char*>(_this) + currentOffset);
+					SlabUnit::construct(unit, i, currentOffset);
 				}
+			}
+
+			static void destroy(SlabBlock* _this) {
+				_free(_this);
 			}
 
 			bool isFull() const {
@@ -102,16 +104,12 @@ namespace slab {
 				SlabBlock* slab = (SlabBlock*)_malloc(baseOffset + (static_cast<size_t>(64) * allocator->unitMetaSize));
 
 				if (slab != nullptr) {
-					return new (slab) SlabBlock(allocator); // placement new to initialize the slab block
+					SlabBlock::construct(slab, allocator);
+					return slab;
 				}
 
 				std::cerr << "create: memory allocation failed." << std::endl;
 				return nullptr;
-			}
-
-			//there is no destructor, so we need to free the memory manually
-			static void destroy(SlabBlock* _this) {
-				_free(_this);
 			}
 
 			static SlabBlock* getBlockFromUnit(const SlabUnit* unit) {
