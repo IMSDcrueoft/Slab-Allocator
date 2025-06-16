@@ -36,6 +36,9 @@ namespace slab {
 			uint32_t offset;			// the offset to SlabBlock
 			char payload[];
 
+			SlabUnit() = delete;
+			~SlabUnit() = delete;
+
 			static void construct(SlabUnit* _this, const uint32_t index, const uint32_t offset) {
 				_this->index = index;
 				_this->offset = offset;
@@ -52,6 +55,9 @@ namespace slab {
 			SlabBlock* prev;			// prev slab in the list
 			uint64_t bitMap;			// bit==1 means free (bitMap != 0)
 			char payload[];				// the slices
+
+			SlabBlock() = delete;
+			~SlabBlock() = delete;
 
 			static void construct(SlabBlock* _this, const SlabAllocator* allocator) {
 				// Calculate the offset of the 'payload' flexible array member in SlabBlock.
@@ -83,16 +89,27 @@ namespace slab {
 				return this->bitMap == UINT64_MAX;
 			}
 
+			bool isUnitAllocated(const uint32_t index) const {
+				// if bit is 0, it means the unit is allocated
+				return bits::get(this->bitMap, index) == 0;
+			}
+
+			SlabUnit* getUnitByIndex(const size_t unitMetaSize, const uint32_t index) const {
+				assert(index < 64 && "Index out of bounds in getUnitByIndex");
+
+				return (SlabUnit*)((char*)this->payload + index * unitMetaSize);
+			}
+
 			SlabUnit* allocateUnit(const size_t unitMetaSize) {
-#if _DEBUG
-				if (this->isFull()) {
-					std::cerr << "allocateUnit: no unit for allocate." << std::endl;
-					return nullptr;
-				}
-#endif
+				assert(!this->isFull() && "SlabBlock is full, cannot allocate unit.");
+
 				uint32_t index = bits::ctz64(this->bitMap);
 				bits::set_zero(this->bitMap, index);
 				return (SlabUnit*)((char*)this->payload + index * unitMetaSize);
+			}
+
+			void deallocateUnit(const uint32_t index) {
+				bits::set_one(this->bitMap, index);
 			}
 
 			static SlabBlock* create(const SlabAllocator* allocator) {
@@ -140,6 +157,12 @@ namespace slab {
 		uint32_t reserved_limit;		// reserved free slab limit
 
 	public:
+		SlabAllocator(const SlabAllocator&) = delete;
+		SlabAllocator& operator=(const SlabAllocator&) = delete;
+
+		SlabAllocator(SlabAllocator&&) = delete;
+		SlabAllocator& operator=(SlabAllocator&&) = delete;
+
 		SlabAllocator(uint32_t unitSize, const uint32_t reserved_limit = 4) {
 			assert(unitSize <= unit_max_size && "Invalid unitSize for SlabAllocator");
 
@@ -267,8 +290,8 @@ namespace slab {
 				return; // invalid slab
 			}
 
-			if (bits::get(slab->bitMap, unit->index) == 0) {
-				bits::set_one(slab->bitMap, unit->index);
+			if (slab->isUnitAllocated(unit->index)) {
+				slab->deallocateUnit(unit->index);
 
 				if (!slab->isEmpty()) return;
 
@@ -399,5 +422,45 @@ namespace slab {
 		}
 	};
 
+	template<typename T>
+	class ObjectPool : public SlabAllocator {
+	public:
+		ObjectPool(const ObjectPool&) = delete;
+		ObjectPool& operator=(const ObjectPool&) = delete;
+
+		ObjectPool(ObjectPool&&) = delete;
+		ObjectPool& operator=(ObjectPool&&) = delete;
+
+		ObjectPool(uint32_t reserved_limit = 4) : SlabAllocator(sizeof(T), reserved_limit) {}
+		~ObjectPool() {
+			SlabBlock* slab = this->head;
+			while (slab != nullptr) {
+				SlabBlock* next = slab->next;
+
+				for (uint32_t i = 0; i < 64; ++i) {
+					if (slab->isUnitAllocated(i)) {
+						SlabUnit* unit = slab->getUnitByIndex(this->unitMetaSize, i);
+						unit->~SlabUnit(); // call destructor for T
+					}
+				}
+
+				SlabBlock::destroy(slab);
+				slab = next;
+			}
+
+			this->head = nullptr;
+			this->cache = nullptr;
+		}
+
+		template<typename... Args>
+		T* allocate(Args&&... args) {
+			return new (SlabAllocator::allocate()) T(std::forward<Args>(args)...);// allocate memory for T using SlabAllocator
+		}
+
+		void deallocate(T* ptr) {
+			ptr->~T(); // call destructor
+			SlabAllocator::deallocate(ptr);
+		}
+	};
 #undef OFFSET_OF
 }
