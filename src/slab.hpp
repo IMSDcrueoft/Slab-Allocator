@@ -22,10 +22,7 @@ namespace slab {
 #endif
 
 	// limit
-	static constexpr auto unit_max_size = 4096;
-	// dont set too small
-	static constexpr auto traverse_threshold = 4;
-
+	constexpr auto unit_max_size = 4096;
 	static void* (*_malloc)(size_t size) = std::malloc;
 	static void (*_free)(void*) = std::free;
 
@@ -148,14 +145,122 @@ namespace slab {
 			}
 		};
 	protected:
-		SlabBlock* head = nullptr;
-		SlabBlock* cache = nullptr;
+		SlabBlock* work = nullptr;
+		SlabBlock* full = nullptr;
 
 		uint32_t unitMetaSize = 0;		// sizeof unit payload + meta
 		uint32_t total_count = 0;		// total slab count
 		uint32_t reserved_count;		// reserved free slab count
 		uint32_t reserved_limit;		// reserved free slab limit
 
+	protected:
+		/**
+		 * @brief create a block for work
+		 */
+		SlabBlock* makeBlock() {
+			SlabBlock* slab = SlabBlock::create(this);
+			if (slab == nullptr) {
+				std::cerr << "slabAllocator: failed in allocating memory." << std::endl;
+				exit(1);
+			}
+			return slab;
+		}
+
+		void destroyList(SlabBlock* begin) {
+			SlabBlock* slab = begin;
+
+			do {
+				SlabBlock* next = slab->next;
+				SlabBlock::destroy(slab);
+				slab = next;
+			} while (slab != begin);
+		}
+
+		void moveFromWorkToFull(SlabBlock* slab) {
+			//remove head from work
+			if (slab->next != slab) {
+				this->work = this->work->next;
+				this->work->prev = slab->prev;
+				slab->prev->next = this->work;
+			}
+			else {
+				this->work = nullptr;
+			}
+
+			//move into full
+			if (this->full != nullptr) {
+				slab->next = this->full;
+				slab->prev = this->full->prev;
+				slab->next->prev = slab;
+				slab->prev->next = slab;
+
+				this->full = slab;
+			}
+			else {
+				slab->next = slab;
+				slab->prev = slab;
+
+				this->full = slab;
+			}
+		}
+
+		void moveFromFullToWork(SlabBlock* slab) {
+			//remove from full
+			if (slab != this->full) {
+				slab->prev->next = slab->next;
+				slab->next->prev = slab->prev;
+			}
+			else {
+				if (slab->next != slab) {
+					slab->prev->next = slab->next;
+					slab->next->prev = slab->prev;
+					this->full = slab->next;
+				}
+				else {
+					this->full = nullptr;
+				}
+			}
+			//move to work head
+			if (this->work != nullptr) {
+				slab->next = this->work;
+				slab->prev = this->work->prev;
+				slab->next->prev = slab;
+				slab->prev->next = slab;
+
+				this->work = slab;
+			}
+			else {
+				slab->next = slab;
+				slab->prev = slab;
+
+				this->work = slab;
+			}
+		}
+
+		void removeFromWorkAndDestroy(SlabBlock* slab) {
+			//remove from work
+			if (slab != this->work) {
+				slab->prev->next = slab->next;
+				slab->next->prev = slab->prev;
+			}
+			else {
+				//remove head from work
+				if (slab->next != slab) {
+					slab->prev->next = slab->next;
+					slab->next->prev = slab->prev;
+					this->work = slab->next;
+				}
+				else {
+					this->work = nullptr;
+				}
+			}
+
+			SlabBlock::destroy(slab);
+			assert(this->total_count > 0 && "Invalid total count.");
+			--this->total_count;
+			assert(this->reserved_count > 0 && "Invalid reserved count.");
+			--this->reserved_count;
+		}
 	public:
 		SlabAllocator(const SlabAllocator&) = delete;
 		SlabAllocator& operator=(const SlabAllocator&) = delete;
@@ -170,24 +275,27 @@ namespace slab {
 			this->unitMetaSize = (sizeof(SlabUnit) + unitSize);
 
 			//create node
-			this->head = SlabBlock::create(this);
-			this->cache = this->head;
+			SlabBlock* slab = this->makeBlock();
+
+			//link as circle
+			slab->next = slab;
+			slab->prev = slab;
+
+			this->work = slab;
 			this->total_count = 1;
 			this->reserved_count = 1;
 			this->reserved_limit = std::max(reserved_limit, 1u);// ensure that there is at least one free
-
-			if (this->head == nullptr) {
-				std::cerr << "slabAllocator: failed in allocating memory." << std::endl;
-				exit(1);
-			}
 		}
 
 		~SlabAllocator() {
-			SlabBlock* slab = this->head;
-			while (slab != nullptr) {
-				SlabBlock* next = slab->next;
-				SlabBlock::destroy(slab);
-				slab = next;
+			if (this->full != nullptr) {
+				destroyList(this->full);
+				this->full = nullptr;
+			}
+
+			if (this->work != nullptr) {
+				destroyList(this->work);
+				this->work = nullptr;
 			}
 		}
 
@@ -204,68 +312,35 @@ namespace slab {
 		}
 
 		void* allocate() {
-#if _DEBUG
-			if (this->head == nullptr || this->cache == nullptr) {
-				std::cerr << "allocate: nullptr allocator." << std::endl;
-				return nullptr; // allocation failed
-			}
-#endif
-			if (!this->cache->isFull()) {
-				if (this->cache->isEmpty()) {
-					assert(this->reserved_count > 0 && "Invalid reserved count.");
-					--this->reserved_count;
-				}
-				return this->cache->allocateUnit(this->unitMetaSize)->payload;
-			}
+			SlabBlock* slab = this->work;
 
-			uint32_t traverseCount = 0;
-			SlabBlock* current = this->head;
+			if (slab == nullptr) {
+				slab = this->makeBlock();
 
-			while (current->isFull()) {
-				if (current->next == nullptr) {
-					SlabBlock* newSlab = SlabBlock::create(this);
-					if (newSlab == nullptr) {
-						std::cerr << "allocate: failed in allocating memory." << std::endl;
-						return nullptr; // allocation failed
-					}
+				//link as a circle
+				slab->prev = slab;
+				slab->next = slab;
 
-					// insert it at slab_head
-					// why? for reducing traversal overhead
-					newSlab->next = this->head;
-					// should not be nullptr in any case
-					if (this->head != nullptr) {
-						this->head->prev = newSlab;
-					}
-					this->head = newSlab;
-					this->cache = newSlab;
-					++this->total_count;
-
-					return newSlab->allocateUnit(this->unitMetaSize)->payload;
-				}
-
-				current = current->next;
-				++traverseCount;
+				this->work = slab;
+				// set the work slab to the new slab
+				++this->total_count;
+				// no need to modify reserved_count
+				return slab->allocateUnit(this->unitMetaSize)->payload;
 			}
 
-			// float forward, one at a time
-			if (traverseCount > traverse_threshold) {
-				current->prev->next = current->next;
-				if (current->next != nullptr) {
-					current->next->prev = current->prev;
-				}
-
-				current->next = this->head;
-				current->prev = nullptr;
-				this->head->prev = current;
-				this->head = current;
-			}
-
-			this->cache = current;
-			if (current->isEmpty()) {
+			if (slab->isEmpty()) {
 				assert(this->reserved_count > 0 && "Invalid reserved count.");
 				--this->reserved_count;
 			}
-			return current->allocateUnit(this->unitMetaSize)->payload;
+
+			void* mem = slab->allocateUnit(this->unitMetaSize)->payload;
+
+			// move to full
+			if (slab->isFull()) {
+				this->moveFromWorkToFull(slab);
+			}
+
+			return mem;
 		}
 
 		void deallocate(void* ptr) {
@@ -291,32 +366,19 @@ namespace slab {
 			}
 
 			if (slab->isUnitAllocated(unit->index)) {
+				bool isFull = slab->isFull();
 				slab->deallocateUnit(unit->index);
 
-				if (!slab->isEmpty()) return;
+				if (isFull) {
+					this->moveFromFullToWork(slab);
+					return;
+				}
 
-				// it's free now
-				++this->reserved_count;
-				if (this->reserved_count > this->reserved_limit) {
-					if (slab == this->head) {
-						this->head = this->head->next;
-						this->head->prev = nullptr;
-					}
-					else {
-						slab->prev->next = slab->next;
-						if (slab->next != nullptr) {
-							slab->next->prev = slab->prev;
-						}
-					}
-
-					SlabBlock::destroy(slab);
-					assert(this->total_count > 0 && "Invalid total count.");
-					--this->total_count;
-					assert(this->reserved_count > 0 && "Invalid reserved count.");
-					--this->reserved_count;
-
-					if (slab == this->cache) {
-						this->cache = this->head;
+				if (slab->isEmpty()) {
+					// it's free now
+					++this->reserved_count;
+					if (this->reserved_count > this->reserved_limit) {
+						this->removeFromWorkAndDestroy(slab);
 					}
 				}
 			}
@@ -325,97 +387,33 @@ namespace slab {
 			}
 		}
 
-		bool prepare_bulk(const uint8_t count) {
-			if (count > 64) {
-				std::cerr << "prepare_bulk: count must not be greater than 64." << std::endl;
-				return false;
-			}
-
-			SlabBlock* slab = this->head;
-
-			while ((slab != nullptr) && bits::popcnt64(slab->bitMap) < count) {
-				if (slab->next == nullptr) {
-					SlabBlock* newSlab = SlabBlock::create(this);
-					if (newSlab == nullptr) {
-						std::cerr << "prepare_bulk: can not allocate slab." << std::endl;
-						return false; // allocation failed
-					}
-
-					// insert it at slab_head
-					// why? for reducing traversal overhead
-					newSlab->next = this->head;
-					this->head->prev = newSlab;
-
-					this->head = newSlab;
-					this->cache = newSlab;
-					++this->total_count;
-
-					return true;
-				}
-
-				slab = slab->next;
-			}
-
-			this->cache = slab;
-			return true;
-		}
-
-		/**
-		 * @brief deallocate idle slabs
-		 * @return 
-		 */
-		uint32_t reclaim() {
-			if (this->head == nullptr) return 0;
-
-			uint32_t freedCount = 0;
-
-			SlabBlock* prev = this->head;
-			SlabBlock* current = prev->next;
-
-			while (current != nullptr) {
-				if (current->isEmpty()) {
-					prev->next = current->next;
-
-					SlabBlock::destroy(current);
-					assert(this->total_count > 0 && "Invalid total count.");
-					--this->total_count;
-					assert(this->reserved_count > 0 && "Invalid reserved count.");
-					--this->reserved_count;
-					++freedCount;
-
-					current = prev->next;
-					//connect
-					if (current != nullptr) {
-						current->prev = prev;
-					}
-				}
-				else {
-					prev = current;
-					current = current->next;
-				}
-			}
-
-			//remind this
-			this->cache = this->head;
-
-			return freedCount;
-		}
-
 		void print_stats() {
 			std::cout << "print_stats:" << std::endl;
 
-			SlabBlock* slab = this->head;
-			uint32_t id = 1;
+			if (this->full != nullptr) {
+				uint32_t count = 0;
+				SlabBlock* slab = this->full;
 
-			while (slab != nullptr) {
-				if (slab == this->cache) {
-					std::cout << "[Cache]" << std::endl;
-				}
-				std::cout << "Slab_" << id << " " << 64 - bits::popcnt64(slab->bitMap) << " / 64" << std::endl;
-				SlabBlock::print_bitMap(slab->bitMap);
-				std::cout << std::endl;
-				slab = slab->next;
-				++id;
+				do {
+					slab = slab->next;
+					++count;
+				} while (slab != this->full);
+
+				std::cout << "full count: " << count << std::endl << std::endl;
+			}
+
+			if (this->work != nullptr) {
+				uint32_t id = 1;
+				SlabBlock* slab = this->work;
+
+				do {
+					std::cout << "slab_" << id << " " << 64 - bits::popcnt64(slab->bitMap) << " / 64" << std::endl;
+					SlabBlock::print_bitMap(slab->bitMap);
+					std::cout << std::endl;
+					slab = slab->next;
+
+					++id;
+				} while (slab != this->work);
 			}
 
 			std::cout << "End" << std::endl;
@@ -423,18 +421,12 @@ namespace slab {
 	};
 
 	template<typename T>
-	class ObjectPool : public SlabAllocator {
-	public:
-		ObjectPool(const ObjectPool&) = delete;
-		ObjectPool& operator=(const ObjectPool&) = delete;
+	class ObjectPool : protected SlabAllocator {
+	protected:
+		void destroyList(SlabBlock* begin) {
+			SlabBlock* slab = begin;
 
-		ObjectPool(ObjectPool&&) = delete;
-		ObjectPool& operator=(ObjectPool&&) = delete;
-
-		ObjectPool(uint32_t reserved_limit = 4) : SlabAllocator(sizeof(T), reserved_limit) {}
-		~ObjectPool() {
-			SlabBlock* slab = this->head;
-			while (slab != nullptr) {
+			do {
 				SlabBlock* next = slab->next;
 
 				for (uint32_t i = 0; i < 64; ++i) {
@@ -446,10 +438,25 @@ namespace slab {
 
 				SlabBlock::destroy(slab);
 				slab = next;
-			}
+			} while (slab != begin);
+		}
+	public:
+		ObjectPool(const ObjectPool&) = delete;
+		ObjectPool& operator=(const ObjectPool&) = delete;
 
-			this->head = nullptr;
-			this->cache = nullptr;
+		ObjectPool(ObjectPool&&) = delete;
+		ObjectPool& operator=(ObjectPool&&) = delete;
+
+		ObjectPool(uint32_t reserved_limit = 4) : SlabAllocator(sizeof(T), reserved_limit) {}
+		~ObjectPool() {
+			if (this->full != nullptr) {
+				destroyList(this->full);
+				this->full = nullptr;
+			}
+			if (this->work != nullptr) {
+				destroyList(this->work);
+				this->work = nullptr;
+			}
 		}
 
 		template<typename... Args>
