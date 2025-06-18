@@ -21,7 +21,7 @@ namespace slab {
 #define OFFSET_OF(type, member) offsetof(type, member)
 #endif
 
-	// limit
+	// limit size
 	constexpr auto unit_max_size = 4096;
 	static void* (*_malloc)(size_t size) = std::malloc;
 	static void (*_free)(void*) = std::free;
@@ -157,12 +157,15 @@ namespace slab {
 		/**
 		 * @brief create a block for work
 		 */
-		SlabBlock* makeBlock() {
+		SlabBlock* makeBlock() const {
 			SlabBlock* slab = SlabBlock::create(this);
 			if (slab == nullptr) {
 				std::cerr << "slabAllocator: failed in allocating memory." << std::endl;
 				exit(1);
 			}
+
+			slab->next = slab; // link as a circle
+			slab->prev = slab; // link as a circle
 			return slab;
 		}
 
@@ -269,17 +272,16 @@ namespace slab {
 		SlabAllocator& operator=(SlabAllocator&&) = delete;
 
 		SlabAllocator(uint32_t unitSize, const uint32_t reserved_limit = 4) {
-			assert(unitSize <= unit_max_size && "Invalid unitSize for SlabAllocator");
+			if (unitSize > slab::unit_max_size) {
+				std::cerr << "Invalid unitSize for SlabAllocator" << std::endl;
+				exit(1);
+			}
 
 			unitSize = (unitSize + 7) & ~7;// align to 8
 			this->unitMetaSize = (sizeof(SlabUnit) + unitSize);
 
 			//create node
 			SlabBlock* slab = this->makeBlock();
-
-			//link as circle
-			slab->next = slab;
-			slab->prev = slab;
 
 			this->work = slab;
 			this->total_count = 1;
@@ -316,10 +318,6 @@ namespace slab {
 
 			if (slab == nullptr) {
 				slab = this->makeBlock();
-
-				//link as a circle
-				slab->prev = slab;
-				slab->next = slab;
 
 				this->work = slab;
 				// set the work slab to the new slab

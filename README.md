@@ -47,7 +47,7 @@ See [LICENSE](LICENSE) file for full license text.
 - Bitmap-based free unit tracking (64-bit)
 - Automatic slab creation when needed
 - Intelligent slab reclamation when empty
-- Cache optimization to reduce traversal overhead
+- Reduce traversal overhead
 - Memory alignment to 8-byte boundaries
 
 ## Usage
@@ -70,9 +70,6 @@ int* data1 = static_cast<int*>(ptr1);
 allocator.deallocate(ptr1);
 allocator.deallocate(ptr2);
 
-// Prepare multiple units in advance
-allocator.prepare_bulk(10);  // Prepare 10 units
-
 // Reclaim empty slabs
 uint32_t freed = allocator.reclaim();
 
@@ -86,7 +83,5 @@ allocator.print_stats();
 
 ## Performance Considerations
 
-- The allocator maintains a "cache" slab to minimize traversal
-- Slabs are automatically moved to the front of the list after threshold traversals
+- The allocator maintains a "full" and a "work" list to minimize traversal
 - Empty slabs beyond the reserved limit are automatically destroyed
-- Bulk preparation can reduce allocation overhead for multiple requests
