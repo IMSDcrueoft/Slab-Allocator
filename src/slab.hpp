@@ -430,7 +430,7 @@ namespace slab {
 				for (uint32_t i = 0; i < 64; ++i) {
 					if (slab->isUnitAllocated(i)) {
 						SlabUnit* unit = slab->getUnitByIndex(this->unitMetaSize, i);
-						unit->~SlabUnit(); // call destructor for T
+						static_cast<T*>(unit->payload)->~T(); // call destructor for T
 					}
 				}
 

@@ -9,8 +9,6 @@ A high-performance memory allocator using slab allocation technique, designed fo
 - **Fast allocation/deallocation**: O(1) average case performance for both operations
 - **Memory efficiency**: Minimizes fragmentation through fixed-size blocks
 - **Automatic slab management**: Creates new slabs when needed and reclaims empty ones
-- **Cache optimization**: Maintains a hot slab for faster allocations
-- **Bulk preparation**: Supports preparing multiple units in advance
 - **Debug support**: Includes extensive error checking and statistics reporting
 
 ## License
@@ -55,6 +53,7 @@ See [LICENSE](LICENSE) file for full license text.
 ### Basic Operations
 
 ```cpp
+#include "./src/slab.hpp"
 // Create an allocator for 256-byte units
 slab::SlabAllocator allocator(256);
 
