@@ -466,6 +466,16 @@ namespace slab {
 			ptr->~T(); // call destructor
 			SlabAllocator::deallocate(ptr);
 		}
+
+		// for advanced users who want to manage construction and destruction themselves
+		T* allocate_no_construct() {
+			return static_cast<T*>(SlabAllocator::allocate());
+		}
+
+		// for advanced users who want to manage construction and destruction themselves
+		void deallocate_no_destruct(T* ptr) {
+			SlabAllocator::deallocate(ptr);
+		}
 	};
 #undef OFFSET_OF
 }
