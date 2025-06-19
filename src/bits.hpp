@@ -82,4 +82,31 @@ namespace bits {
 		return n;
 #endif  
 	}
+
+	static inline uint8_t clz64(uint64_t x) {
+#if defined(__clang__) || defined(__GNUC__)
+		return x ? static_cast<uint8_t>(__builtin_clzll(x)) : 64;
+#elif defined(_MSC_VER)
+		unsigned long index;
+		if (_BitScanReverse64(&index, x))
+			return static_cast<uint8_t>(63 - index);
+		else
+			return 64;
+#else
+		if (x == 0) return 64;
+		uint8_t n = 0;
+		if ((x >> 32) == 0) { n += 32; }
+		else { x >>= 32; }
+		if ((x >> 16) == 0) { n += 16; }
+		else { x >>= 16; }
+		if ((x >> 8) == 0) { n += 8; }
+		else { x >>= 8; }
+		if ((x >> 4) == 0) { n += 4; }
+		else { x >>= 4; }
+		if ((x >> 2) == 0) { n += 2; }
+		else { x >>= 2; }
+		if ((x >> 1) == 0) { n += 1; }
+		return n;
+#endif
+	}
 }
