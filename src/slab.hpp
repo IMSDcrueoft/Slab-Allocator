@@ -430,7 +430,7 @@ namespace slab {
 				for (uint32_t i = 0; i < 64; ++i) {
 					if (slab->isUnitAllocated(i)) {
 						SlabUnit* unit = slab->getUnitByIndex(this->unitMetaSize, i);
-						static_cast<T*>(unit->payload)->~T(); // call destructor for T
+						reinterpret_cast<T*>(unit->payload)->~T(); // call destructor for T
 					}
 				}
 
@@ -469,7 +469,7 @@ namespace slab {
 
 		// for advanced users who want to manage construction and destruction themselves
 		T* allocate_no_construct() {
-			return static_cast<T*>(SlabAllocator::allocate());
+			return reinterpret_cast<T*>(SlabAllocator::allocate());
 		}
 
 		// for advanced users who want to manage construction and destruction themselves
