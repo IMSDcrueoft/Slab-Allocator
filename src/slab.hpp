@@ -22,7 +22,7 @@ namespace slab {
 #endif
 
 	// limit size
-	constexpr auto unit_max_size = 4096;
+	constexpr auto unit_max_size = 1024;
 	static void* (*_malloc)(size_t size) = std::malloc;
 	static void (*_free)(void*) = std::free;
 
