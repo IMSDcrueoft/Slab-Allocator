@@ -28,6 +28,95 @@ public:
 	}
 };
 
+void test_allocation_correctness(size_t fixed_size, size_t num_operations) {
+	std::vector<void*> ptrs;
+	std::vector<bool> allocated;
+	ptrs.reserve(MAX_ALLOCATIONS);
+	allocated.reserve(MAX_ALLOCATIONS);
+
+	slab::FixedAllocator alloc(fixed_size, 1);
+
+	Xorshift64 rng(123456789);
+
+	for (size_t i = 0; i < num_operations; ++i) {
+		if ((rng.next_u64() % 2 == 0 || ptrs.empty()) && ptrs.size() < MAX_ALLOCATIONS) {
+			void* ptr = alloc.allocate();
+			if (ptr == nullptr) {
+				std::cerr << "test_allocation_correctness: allocation failed at operation " << i << std::endl;
+				goto cleanup;
+			}
+
+			// check ptr is not already in our list
+			for (size_t j = 0; j < ptrs.size(); ++j) {
+				if (ptrs[j] == ptr) {
+					std::cerr << "test_allocation_correctness: duplicate allocation detected at operation " << i << std::endl;
+					goto cleanup;
+				}
+			}
+
+			// check ptr alignment (should be at least 8-byte aligned)
+			if ((reinterpret_cast<uintptr_t>(ptr) & 7) != 0) {
+				std::cerr << "test_allocation_correctness: alignment error at operation " << i << std::endl;
+				goto cleanup;
+			}
+
+			ptrs.push_back(ptr);
+			allocated.push_back(true);
+
+			// write pattern to detect corruption
+			std::memset(ptr, 0xAA, fixed_size);
+
+		}
+		else if (!ptrs.empty()) {
+			int idx = rng.next_u64() % ptrs.size();
+
+			if (!allocated[idx]) {
+				std::cerr << "test_allocation_correctness: double free detected at operation " << i << std::endl;
+				goto cleanup;
+			}
+
+			// verify pattern before free
+			uint8_t* bytes = static_cast<uint8_t*>(ptrs[idx]);
+			for (size_t j = 0; j < fixed_size; ++j) {
+				if (bytes[j] != 0xAA) {
+					std::cerr << "test_allocation_correctness: memory corruption detected at operation " << i << ", byte " << j << std::endl;
+					goto cleanup;
+				}
+			}
+
+			alloc.deallocate(ptrs[idx]);
+			allocated[idx] = false;
+
+			// remove from array by swapping with last
+			if (idx != static_cast<int>(ptrs.size() - 1)) {
+				ptrs[idx] = ptrs.back();
+				allocated[idx] = allocated.back();
+			}
+			ptrs.pop_back();
+			allocated.pop_back();
+		}
+	}
+
+	// free remaining allocations
+	for (size_t i = 0; i < ptrs.size(); ++i) {
+		if (allocated[i]) {
+			alloc.deallocate(ptrs[i]);
+		}
+	}
+
+	std::cout << "[Size " << fixed_size << "] test_allocation_correctness: " << num_operations << " operations completed successfully." << std::endl;
+
+	return;
+
+cleanup:
+	// free remaining allocations
+	for (size_t i = 0; i < ptrs.size(); ++i) {
+		if (allocated[i]) {
+			alloc.deallocate(ptrs[i]);
+		}
+	}
+}
+
 void test_fixed_size_allocations_and_frees(size_t fixed_size, size_t num_operations) {
 	std::vector<void*> malloc_ptrs;
 	std::vector<void*> slab_ptrs;
@@ -87,6 +176,11 @@ void test_fixed_size_allocations_and_frees(size_t fixed_size, size_t num_operati
 int main() {
 	size_t sizes[] = { 8, 12, 16, 20, 24, 28, 32, 40, 48, 56, 64, 80, 96, 112, 128, 192, 256, 384, 512, 768, 1024 };
 	size_t num_operations = 4e6; // Increase number of operations
+
+	for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); ++i) {
+		test_allocation_correctness(sizes[i], 1e5);
+		std::cout << std::endl;
+	}
 
 	for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); ++i) {
 		test_fixed_size_allocations_and_frees(sizes[i], num_operations);

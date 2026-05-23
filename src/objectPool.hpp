@@ -5,6 +5,7 @@
 */
 #pragma once
 #include <cstdint>
+#include <cassert>
 #include "slab.h"
 
 namespace slab {
@@ -19,6 +20,8 @@ namespace slab {
 		FixedAllocator& operator=(FixedAllocator&&) = delete;
 
 		FixedAllocator(size_t size, uint32_t reserved_limit = 4) {
+			assert(size > 0 && "FixedAllocator size must be greater than 0");
+
 			if (!slab_constructAllocator(&this->allocator, size, reserved_limit)) {
 				// disabled exceptions in this project
 				std::cerr << "Failed to construct FixedAllocator with size " << size << " and reserved_limit " << reserved_limit << std::endl;
