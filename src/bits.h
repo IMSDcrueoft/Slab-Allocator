@@ -21,9 +21,9 @@ size_t bits_popcnt64(uint64_t x);
 size_t bits_ctz64(uint64_t x);
 size_t bits_clz64(uint64_t x);
 
-#define bits_set_one(value, bitIdx) ((value) |= ((size_t)1u << (bitIdx)))
-#define bits_set_zero(value, bitIdx) ((value) &= ~((size_t)1u << (bitIdx)))
-#define bits_get(value, bitIdx) (((value) >> (bitIdx)) & (size_t)1u)
+#define bits_set_one(value, bitIdx) ((value) |= ((uint64_t)1u << (bitIdx)))
+#define bits_set_zero(value, bitIdx) ((value) &= ~((uint64_t)1u << (bitIdx)))
+#define bits_get(value, bitIdx) (((value) >> (bitIdx)) & (uint64_t)1u)
 
 #if defined(__clang__) || defined(__GNUC__)  
 // GCC / Clang / Linux / macOS / iOS / Android  
