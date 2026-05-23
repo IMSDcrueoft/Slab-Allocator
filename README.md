@@ -1,10 +1,9 @@
 # Slab Allocator
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/IMSDcrueoft/Slab-Allocator)
-
-A high-performance memory allocator using slab allocation technique, designed for efficient fixed-size memory allocations.
+A high-performance single-thread memory allocator using slab allocation technique, designed for efficient fixed-size memory allocations.
 
 ## Features
 
+- **Api**: Provides both C and CPP interfaces
 - **Slab-based allocation**: Organizes memory into slabs containing fixed-size units
 - **Fast allocation/deallocation**: O(1) average case performance for both operations
 - **Memory efficiency**: Minimizes fragmentation through fixed-size blocks
@@ -40,7 +39,7 @@ See [LICENSE](LICENSE) file for full license text.
 
 ### Technical Specifications
 
-- Fixed unit sizes (configurable at creation, up to 4096 bytes)
+- Fixed unit sizes (configurable at creation, up to 1024 bytes)
 - 64 units per slab block
 - Bitmap-based free unit tracking (64-bit)
 - Automatic slab creation when needed
@@ -53,9 +52,9 @@ See [LICENSE](LICENSE) file for full license text.
 ### Basic Operations
 
 ```cpp
-#include "./src/slab.hpp"
+#include "./src/objectPool.hpp"
 // Create an allocator for 256-byte units
-slab::SlabAllocator allocator(256);
+slab::FixedAllocator allocator(256);
 
 // Allocate memory
 void* ptr1 = allocator.allocate();
@@ -68,9 +67,6 @@ int* data1 = static_cast<int*>(ptr1);
 // Deallocate memory
 allocator.deallocate(ptr1);
 allocator.deallocate(ptr2);
-
-// Reclaim empty slabs
-uint32_t freed = allocator.reclaim();
 
 // Get statistics
 std::cout << "Total slabs: " << allocator.total() << std::endl;
