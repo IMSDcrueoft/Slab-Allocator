@@ -2,7 +2,7 @@
 #include <cstdlib>
 #include <chrono>
 #include <vector>
-#include "./src/slab.hpp"
+#include "./src/objectPool.hpp"
 
 // Define the maximum number of allocations
 #define MAX_ALLOCATIONS 100000
@@ -33,7 +33,7 @@ void test_fixed_size_allocations_and_frees(size_t fixed_size, size_t num_operati
 	std::vector<void*> slab_ptrs;
 	malloc_ptrs.reserve(MAX_ALLOCATIONS);
 	slab_ptrs.reserve(MAX_ALLOCATIONS);
-	slab::SlabAllocator slabAlloc(fixed_size, 1);
+	slab::FixedAllocator alloc(fixed_size, 1);
 
 	uint64_t seed = static_cast<uint64_t>(std::chrono::system_clock::now().time_since_epoch().count());
 	Xorshift64 rng(seed);
@@ -67,11 +67,11 @@ void test_fixed_size_allocations_and_frees(size_t fixed_size, size_t num_operati
 	start = std::chrono::high_resolution_clock::now();
 	for (size_t i = 0; i < num_operations; ++i) {
 		if ((rng.next_u64() % 2 == 0 || slab_ptrs.empty()) && slab_ptrs.size() < MAX_ALLOCATIONS) {
-			slab_ptrs.push_back(slabAlloc.allocate());
+			slab_ptrs.push_back(alloc.allocate());
 		}
 		else if (!slab_ptrs.empty()) {
 			int idx = rng.next_u64() % slab_ptrs.size();
-			slabAlloc.deallocate(slab_ptrs[idx]);
+			alloc.deallocate(slab_ptrs[idx]);
 			slab_ptrs[idx] = slab_ptrs.back();
 			slab_ptrs.pop_back();
 		}
@@ -81,14 +81,11 @@ void test_fixed_size_allocations_and_frees(size_t fixed_size, size_t num_operati
 	std::cout << "[Size " << fixed_size << "] Slab:   " << diff.count() << "ms, "
 		<< (diff.count() / (num_operations / 1e6)) << "ms/Mops" << std::endl;
 
-	// slabAlloc.print_stats(); // Enable if needed
-
-	// Cleanup
-	// SlabAllocator destructor will automatically release resources
+	// alloc.print_stats(); // Enable if needed
 }
 
 int main() {
-	size_t sizes[] = { 8, 12, 16, 20, 24, 28, 32, 40, 48, 56, 64, 80, 96, 112, 128, 192, 256, 384, 512, 768, 1024, 2048, 4096 };
+	size_t sizes[] = { 8, 12, 16, 20, 24, 28, 32, 40, 48, 56, 64, 80, 96, 112, 128, 192, 256, 384, 512, 768, 1024 };
 	size_t num_operations = 4e6; // Increase number of operations
 
 	for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); ++i) {
