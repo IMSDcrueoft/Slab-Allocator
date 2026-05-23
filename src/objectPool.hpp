@@ -56,7 +56,10 @@ namespace slab {
 		ObjectPool& operator=(ObjectPool&&) = delete;
 
 		ObjectPool(uint32_t reserved_limit = 4) {
-			slab_constructAllocator(&this->allocator, sizeof(T), reserved_limit);
+			if (!slab_constructAllocator(&this->allocator, sizeof(T), reserved_limit)) {
+				std::cerr << "Failed to construct ObjectPool with size " << sizeof(T) << " and reserved_limit " << reserved_limit << std::endl;
+				exit(1);
+			}
 		}
 
 		~ObjectPool() {
