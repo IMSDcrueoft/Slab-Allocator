@@ -153,12 +153,16 @@ static void destroyListWithUnitDestructor(const SlabAllocator* _this, SlabBlock*
 
     do {
         SlabBlock* next = slab->next;
-        for (uint32_t i = 0; i < 64; ++i) {
-            if (isSlabBlockUnitAllocated(slab, i)) {
-                SlabUnit* unit = getSlabBlockUnitByIndex(slab, _this->unit_meta_size, i);
-                destructor(unit->payload); // call the provided callback for each allocated unit
+
+        if (destructor) {
+            for (uint32_t i = 0; i < 64; ++i) {
+                if (isSlabBlockUnitAllocated(slab, i)) {
+                    SlabUnit* unit = getSlabBlockUnitByIndex(slab, _this->unit_meta_size, i);
+                    destructor(unit->payload); // call the provided callback for each allocated unit
+                }
             }
         }
+
         destroySlabBlock(slab);
         slab = next;
     } while (slab != begin);

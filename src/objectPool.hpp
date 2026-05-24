@@ -30,7 +30,7 @@ namespace slab {
 		}
 
 		~FixedAllocator() {
-			slab_destructAllUnits(&this->allocator, [](void* ptr) {});
+			slab_destructAllUnits(&this->allocator, nullptr);
 		}
 
 		// for advanced users who want to manage construction and destruction themselves
