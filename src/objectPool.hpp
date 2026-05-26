@@ -22,10 +22,22 @@ namespace slab {
 		FixedAllocator(size_t size, uint32_t reserved_limit = 4) {
 			assert(size > 0 && "FixedAllocator size must be greater than 0");
 
-			if (!slab_constructAllocator(&this->allocator, size, reserved_limit)) {
+			bool isSuccess = slab_constructAllocator(
+				&this->allocator,
+				size,
+				reserved_limit,
+				nullptr,
+				[](slab_allocatorPointer_t ignore, size_t size) {
+					return reinterpret_cast<void*>(new char[size]);
+				},
+				[](slab_allocatorPointer_t ignore, void* ptr) {
+					delete[] reinterpret_cast<char*>(ptr);
+				});
+
+			if (!isSuccess) {
 				// disabled exceptions in this project
 				std::cerr << "Failed to construct FixedAllocator with size " << size << " and reserved_limit " << reserved_limit << std::endl;
-				exit(1);
+				std::abort();
 			}
 		}
 
@@ -56,9 +68,21 @@ namespace slab {
 		ObjectPool& operator=(ObjectPool&&) = delete;
 
 		ObjectPool(uint32_t reserved_limit = 4) {
-			if (!slab_constructAllocator(&this->allocator, sizeof(T), reserved_limit)) {
+			bool isSuccess = slab_constructAllocator(
+				&this->allocator,
+				sizeof(T),
+				reserved_limit,
+				nullptr,
+				[](slab_allocatorPointer_t ignore, size_t size) {
+					return reinterpret_cast<void*>(new char[size]);
+				},
+				[](slab_allocatorPointer_t ignore, void* ptr) {
+					delete[] reinterpret_cast<char*>(ptr);
+				});
+
+			if (!isSuccess) {
 				std::cerr << "Failed to construct ObjectPool with size " << sizeof(T) << " and reserved_limit " << reserved_limit << std::endl;
-				exit(1);
+				std::abort();
 			}
 		}
 

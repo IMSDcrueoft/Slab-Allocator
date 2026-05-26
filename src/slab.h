@@ -5,13 +5,17 @@
 */
 #pragma once
 
+typedef void* slab_allocatorPointer_t;
+typedef void* (*slab_mallocMethod_t)(slab_allocatorPointer_t, size_t);
+typedef void (*slab_freeMethod_t)(slab_allocatorPointer_t, void*);
+
 #ifdef __cplusplus
 #include<cstdint>
 extern "C" {
 	// hidden
 	typedef struct SlabAllocator
 	{
-		uintptr_t pointers[2];
+		uintptr_t pointers[5];
 		uint32_t data[4];
 	} SlabAllocator;
 #else
@@ -24,10 +28,14 @@ typedef struct SlabAllocator
 	SlabBlock* work;
 	SlabBlock* full;
 
-	uint32_t unit_meta_size;		// sizeof unit payload + meta
+	slab_allocatorPointer_t upperAllocator;     // pointer to the upper allocator
+	slab_mallocMethod_t upperMalloc;            // function pointer for upper allocator malloc
+	slab_freeMethod_t upperFree;                // function pointer for upper allocator free
+
+	uint32_t unit_meta_size;	// sizeof unit payload + meta
 	uint32_t total_count;		// total slab count
-	uint32_t reserved_count;	// reserved free slab count
-	uint32_t reserved_limit;	// reserved free slab limit
+	uint32_t reserved_count;	// reserved completely free blocks
+	uint32_t reserved_limit;	// reserved completely free blocks, the excess part is immediately reclaimed
 } SlabAllocator;
 
 #endif
@@ -35,16 +43,33 @@ typedef struct SlabAllocator
 * placement new for SlabAllocator, the memory block should be at least sizeof(SlabAllocator) bytes
 * returns if is success
 */
-bool slab_constructAllocator(void* memory, uint32_t unitSize, const uint32_t reserved_limit);
+bool slab_constructAllocator(
+	void* memory,
+	uint32_t unitSize,
+	const uint32_t reserved_limit,
+
+	// Used for internal data allocation
+	slab_allocatorPointer_t upperAllocator,
+	slab_mallocMethod_t upperMalloc,
+	slab_freeMethod_t upperFree
+);
 /*
 * destruct with callback for each allocated unit, the callback will be called with the pointer to the unit payload
 * this will not destruct allocator it self, so you can reuse the allocator after this
 */
 void slab_destructAllUnits(SlabAllocator* const _this, void (*destructor)(void*));
 /*
-* simple construct by malloc
+* simple construct by upperMalloc
 */
-SlabAllocator* slab_createAllocator(uint32_t unitSize, const uint32_t reserved_limit);
+SlabAllocator* slab_createAllocator(
+	uint32_t unitSize,
+	const uint32_t reserved_limit,
+
+	// Used for internal data allocation & self data allocation
+	slab_allocatorPointer_t upperAllocator,
+	slab_mallocMethod_t upperMalloc,
+	slab_freeMethod_t upperFree
+);
 /*
 * if you use placement new, don't call this
 */
