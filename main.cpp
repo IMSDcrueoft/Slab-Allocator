@@ -174,7 +174,7 @@ void test_fixed_size_allocations_and_frees(size_t fixed_size, size_t num_operati
 }
 
 int main() {
-	size_t sizes[] = { 8, 12, 16, 20, 24, 28, 32, 40, 48, 56, 64, 80, 96, 112, 128, 192, 256, 384, 512, 768, 1024 };
+	size_t sizes[] = { 8, 12, 16, 20, 24, 28, 32, 40, 48, 56, 64, 80, 96, 112, 128, 192, 256 };
 	size_t num_operations = 4e6; // Increase number of operations
 
 	for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); ++i) {

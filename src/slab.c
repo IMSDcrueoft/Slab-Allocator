@@ -28,7 +28,7 @@ typedef struct SlabBlock
 	char payload[];                  // flexible array member for unit data
 } SlabBlock;
 
-#define UNIT_MAX_SIZE 1024
+#define UNIT_MAX_SIZE 256
 
 static void constructSlabUnit(SlabUnit* _this, const uint32_t index, const uint32_t offset) {
 	_this->index = index;
@@ -209,11 +209,21 @@ static void moveSlabBlockFromWorkToFull(SlabAllocator* _this, SlabBlock* slab) {
 static void moveSlabBlockFromFullToWork(SlabAllocator* _this, SlabBlock* slab) {
 	// remove from full
 	if (slab != _this->full) {
+		if(slab->prev->next != slab || slab->next->prev != slab) {
+			fprintf(stderr, "moveSlabBlockFromFullToWork: Detected corrupted full list.\n");
+			abort();// if this happens, it means data error or out-of-bounds modification attack
+		}
+
 		slab->prev->next = slab->next;
 		slab->next->prev = slab->prev;
 	}
 	else {
 		if (slab->next != slab) {
+			if (slab->prev->next != slab || slab->next->prev != slab) {
+				fprintf(stderr, "moveSlabBlockFromFullToWork: Detected corrupted full list.\n");
+				abort();// if this happens, it means data error or out-of-bounds modification attack
+			}
+
 			slab->prev->next = slab->next;
 			slab->next->prev = slab->prev;
 			_this->full = slab->next;
@@ -423,16 +433,22 @@ void* slab_allocate(SlabAllocator* const _this) {
 }
 
 void slab_deallocate(SlabAllocator* const _this, void* ptr) {
-	if (ptr == NULL) {
-		fprintf(stderr, "deallocate: Invalid pointer nullptr.\n");
+	if (_this == NULL) {
+		fprintf(stderr, "deallocate: Invalid slab allocator.\n");
+		return;
+	}
+
+	if (ptr == NULL || ((uintptr_t)ptr & 0b111) != 0) {
+		fprintf(stderr, "deallocate: Invalid pointer.\n");
 		return;
 	}
 
 	// getSlabUnitFromPtr
 	SlabUnit* unit = getUnitFromPayload(ptr);
 
-	if (unit->index >= 64) {
-		fprintf(stderr, "deallocate: Invalid unit index %u\n", unit->index);
+	const size_t baseOffset = OFFSET_OF(SlabBlock, payload);
+	if ((unit->index >= 64) || (unit->offset != (baseOffset + (size_t)_this->unit_meta_size * unit->index))) {
+		fprintf(stderr, "deallocate: Invalid unit index %u or offset %u\n", unit->index, unit->offset);
 		return;
 	}
 
