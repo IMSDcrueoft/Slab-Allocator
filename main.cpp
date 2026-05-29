@@ -134,7 +134,8 @@ void test_fixed_size_allocations_and_frees(size_t fixed_size, size_t num_operati
 			malloc_ptrs.push_back(std::malloc(fixed_size));
 		}
 		else if (!malloc_ptrs.empty()) {
-			int idx = rng.next_u64() % malloc_ptrs.size();
+			// mod
+			int idx = ((rng.next_u64() & 0xffffffff) * malloc_ptrs.size()) >> 32;
 			std::free(malloc_ptrs[idx]);
 			malloc_ptrs[idx] = malloc_ptrs.back();
 			malloc_ptrs.pop_back();
@@ -159,7 +160,7 @@ void test_fixed_size_allocations_and_frees(size_t fixed_size, size_t num_operati
 			slab_ptrs.push_back(alloc.allocate());
 		}
 		else if (!slab_ptrs.empty()) {
-			int idx = rng.next_u64() % slab_ptrs.size();
+			int idx = ((rng.next_u64() & 0xffffffff) * slab_ptrs.size()) >> 32;
 			alloc.deallocate(slab_ptrs[idx]);
 			slab_ptrs[idx] = slab_ptrs.back();
 			slab_ptrs.pop_back();
