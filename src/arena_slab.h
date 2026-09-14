@@ -144,6 +144,12 @@ extern "C" {
 	typedef enum { SLAB_LAYER_NONE = 0, SLAB_LAYER_SMALL } slabLayer;
 	slabLayer arenaSlab_which(ArenaSlabAllocator* context, void* pointer);
 
+	/* Segment base for external pointer compression, returned as an integer on purpose:
+	 * treat it only as a numeric base — store heap references as offsets and decode as
+	 * base + offset (exact as u32 while the segment is <= 4GB); do not dereference it.
+	 * Returns 0 while the context is uninitialized. */
+	uintptr_t arenaSlab_segmentBase(ArenaSlabAllocator* context);
+
 	/* Lazy return: drop page contents of empty arenas (metadata is kept);
 	 * never changes allocator state; safe to call anytime; returns dropped bytes.
 	 * trim is NEVER called automatically by design; call it from safe points. */

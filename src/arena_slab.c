@@ -472,6 +472,14 @@ slabLayer arenaSlab_which(ArenaSlabAllocator* context, void* pointer) {
 	return SLAB_LAYER_NONE;
 }
 
+/* Segment base as a plain integer: embedders compress heap references against this numeric
+ * base (store offset, decode base + offset) without poking into the struct internals.
+ * It is deliberately not a pointer — the API never hands out the segment as an object. */
+uintptr_t arenaSlab_segmentBase(ArenaSlabAllocator* context) {
+	if (context == NULL || !context->initialized) return 0;
+	return (uintptr_t)context->segment.base;
+}
+
 /* ---- Lazy return (small only) ---- */
 static size_t trimSmallLayer(ArenaSlabAllocator* context) {
 	uint32_t pageSize = osPageSize();

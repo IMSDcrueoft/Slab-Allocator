@@ -164,6 +164,7 @@ static void testInitValidation(void) {
 	CHECK(arenaSlab_free(NULL, NULL) == false); /* NULL context is rejected */
 	CHECK(arenaSlab_which(NULL, NULL) == SLAB_LAYER_NONE);
 	CHECK(arenaSlab_usable_size(NULL, NULL) == 0);
+	CHECK(arenaSlab_segmentBase(NULL) == 0);
 	CHECK(arenaSlab_trim(NULL) == 0);
 	arenaSlab_shutdown(NULL); /* must not crash */
 	arenaSlab_statsReset(NULL);
@@ -179,6 +180,14 @@ static void testDefaultInstance(void) {
 	CHECK(((uintptr_t)pointer & 15) == 0);
 	CHECK(arenaSlab_which(&arenaSlabDefault, pointer) == SLAB_LAYER_SMALL);
 	CHECK(arenaSlab_usable_size(&arenaSlabDefault, pointer) == 256);
+
+	/* segment base: external pointer compression must round-trip through a u32 offset */
+	uintptr_t base = arenaSlab_segmentBase(&arenaSlabDefault);
+	CHECK(base != 0);
+	CHECK((uintptr_t)pointer >= base); /* slots live inside [base, base + segmentBytes) */
+	uint32_t compressed = (uint32_t)((uintptr_t)pointer - base);
+	CHECK(base + compressed == (uintptr_t)pointer);
+
 	CHECK(arenaSlab_free(&arenaSlabDefault, pointer) == true);
 
 	/* re-init on an already initialized instance is a no-op (stays 4GB) */
@@ -186,6 +195,7 @@ static void testDefaultInstance(void) {
 
 	arenaSlab_shutdown(&arenaSlabDefault);
 	CHECK(arenaSlab_alloc(&arenaSlabDefault, 16) == NULL); /* unusable after shutdown */
+	CHECK(arenaSlab_segmentBase(&arenaSlabDefault) == 0);
 }
 
 /* ---- slot classes, alignment, usable size, double free ---- */
