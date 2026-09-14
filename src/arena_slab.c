@@ -261,20 +261,6 @@ static ArenaHead* segmentPopRevive(Segment* segment) {
 	return arena;
 }
 
-/* Shared free-chain of trimmed empty arenas, reusable by every slot class */
-static void segmentPushDropped(Segment* segment, ArenaHead* arena) {
-	arena->next = segment->dropped;
-	segment->dropped = (uint64_t)((uint8_t*)arena - segment->base);
-}
-
-static ArenaHead* segmentPopDropped(Segment* segment) {
-	if (segment->dropped == (uint64_t)SLAB_OFFSET_NONE) return NULL;
-	ArenaHead* arena = (ArenaHead*)(segment->base + segment->dropped);
-	segment->dropped = arena->next;
-	arena->next = (uint64_t)SLAB_OFFSET_UNLINKED;
-	return arena;
-}
-
 /* ---- Small layer ---- */
 
 static uint32_t slotClassIndexOf(size_t size) {
@@ -627,7 +613,7 @@ static size_t trimResidentRing(ArenaSlabAllocator* context) {
 	return droppedBytes;
 }
 
-size_t arenaSlab_trim(ArenaSlabAllocator* context, uint32_t keepEmpty) {
+size_t arenaSlab_trim(ArenaSlabAllocator* context) {
 	if (context == NULL || context->cookie != arenaSlabCookie) return 0;
 	return trimResidentRing(context);
 }

@@ -166,7 +166,7 @@ static void testInitValidation(void) {
 	CHECK(arenaSlab_which(NULL, NULL) == SLAB_LAYER_NONE);
 	CHECK(arenaSlab_usable_size(NULL, NULL) == 0);
 	CHECK(arenaSlab_segmentBase(NULL) == 0);
-	CHECK(arenaSlab_trim(NULL, 0) == 0);
+	CHECK(arenaSlab_trim(NULL) == 0);
 	arenaSlab_shutdown(NULL); /* must not crash */
 	arenaSlab_statsReset(NULL);
 
@@ -1262,7 +1262,7 @@ static void runBenches(void) {
 	CHECK(arenaSlab_init(&allocator, SEGMENT_SIZE_EXPONENT_DEFAULT) == true);
 	void* statsPointer = arenaSlab_alloc(&allocator, 64);
 	arenaSlab_free(&allocator, statsPointer);
-	(void)arenaSlab_trim(&allocator, TRIM_KEEP_EMPTY_DEFAULT);
+	(void)arenaSlab_trim(&allocator);
 	arenaSlab_dumpStats(&allocator);
 	arenaSlab_statsReset(&allocator);
 
