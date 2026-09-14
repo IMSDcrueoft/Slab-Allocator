@@ -4,6 +4,7 @@
  * See LICENSE file in the root directory for full license text.
 */
 #pragma once
+#include <stddef.h>
 #include <stdint.h>
 uint8_t bits_ceil8(uint8_t x);
 uint16_t bits_ceil16(uint16_t x);
