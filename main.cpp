@@ -179,7 +179,8 @@ static void testInitValidation(void) {
 	CHECK(arenaSlab_which(&garbage, &garbage) == SLAB_LAYER_NONE);
 	CHECK(arenaSlab_usable_size(&garbage, &garbage) == 0);
 	CHECK(arenaSlab_segmentBase(&garbage) == 0);
-	CHECK(arenaSlab_trim(&garbage, 0) == 0);
+	CHECK(arenaSlab_trim(&garbage) == 0);
+	CHECK(arenaSlab_calloc(&garbage, 1, 8) == NULL);
 	CHECK(arenaSlab_free(&garbage, &garbage) == false);
 	arenaSlab_shutdown(&garbage); /* must be a no-op, never a release of garbage pointers */
 	arenaSlab_statsReset(&garbage);
@@ -222,10 +223,10 @@ static void testDefaultInstance(void) {
 	CHECK(arenaSlab_segmentBase(&arenaSlabDefault) == 0);
 }
 
-/* ---- slot classes, alignment, usable size, double free ---- */
+/* ---- slot classes, alignment, usable size ---- */
 static void testClassBasics(ArenaSlabAllocator* allocator) {
-	static const size_t sizes[] = { 1, 16, 17, 32, 33, 64, 65, 128, 129, 256 };
-	static const size_t expectedUsable[] = { 16, 16, 32, 32, 64, 64, 128, 128, 256, 256 };
+	static const size_t sizes[] = { 1, 8, 9, 16, 17, 32, 33, 64, 65, 128, 129, 256 };
+	static const size_t expectedUsable[] = { 8, 8, 16, 16, 32, 32, 64, 64, 128, 128, 256, 256 };
 	const uint32_t count = (uint32_t)(sizeof(sizes) / sizeof(sizes[0]));
 	void* pointers[sizeof(sizes) / sizeof(sizes[0])];
 
@@ -233,30 +234,59 @@ static void testClassBasics(ArenaSlabAllocator* allocator) {
 		pointers[index] = arenaSlab_alloc(allocator, sizes[index]);
 		CHECK(pointers[index] != NULL);
 		if (pointers[index] == NULL) continue;
-		CHECK(((uintptr_t)pointers[index] & 15) == 0); /* always 16B aligned */
+		/* the 8B class returns 8B-aligned pointers, every other class 16B */
+		uintptr_t alignMask = (expectedUsable[index] == 8) ? 7 : 15;
+		CHECK(((uintptr_t)pointers[index] & alignMask) == 0);
 		CHECK(arenaSlab_usable_size(allocator, pointers[index]) == expectedUsable[index]);
 		CHECK(arenaSlab_which(allocator, pointers[index]) == SLAB_LAYER_SMALL);
 		memset(pointers[index], (int)(index + 1), expectedUsable[index]); /* writable */
 	}
 
-	/* size 0 -> 16B class; oversize -> NULL */
+	/* size 0 -> 8B class; oversize -> NULL */
 	void* zero = arenaSlab_alloc(allocator, 0);
 	CHECK(zero != NULL);
-	CHECK(arenaSlab_usable_size(allocator, zero) == 16);
+	CHECK(arenaSlab_usable_size(allocator, zero) == 8);
 	CHECK(arenaSlab_free(allocator, zero) == true);
 	CHECK(arenaSlab_alloc(allocator, 257) == NULL);
 	CHECK(arenaSlab_alloc(allocator, (size_t)-1) == NULL);
 
 	for (uint32_t index = 0; index < count; index++) {
 		CHECK(arenaSlab_free(allocator, pointers[index]) == true);
-		CHECK(arenaSlab_free(allocator, pointers[index]) == false); /* double free rejected */
+		/* double free is NOT rejected by design: freed slot memory doubles as freelist
+		 * state, so a second free here would corrupt the list — never do it */
+	}
+
+	/* 8B arena cycle: bump through a whole arena (2044 payload slots), the next slot
+	 * opens a second arena; freeing everything parks both back through the ring */
+	enum { SLOTS_8B = 2044 };
+	void* slots8b[SLOTS_8B + 1];
+	for (uint32_t index = 0; index <= SLOTS_8B; index++) {
+		slots8b[index] = arenaSlab_alloc(allocator, 8);
+		CHECK(slots8b[index] != NULL);
+		CHECK(arenaSlab_usable_size(allocator, slots8b[index]) == 8);
+		CHECK(((uintptr_t)slots8b[index] & 7) == 0);
+		memset(slots8b[index], 0x8B, 8); /* writable */
+	}
+	for (uint32_t index = 0; index <= SLOTS_8B; index++) {
+		CHECK(arenaSlab_free(allocator, slots8b[index]) == true);
+	}
+
+	/* revival: both parked shells come back through the ring (O(1) re-init, no syscall)
+	 * and the identical bump cycle repeats */
+	for (uint32_t index = 0; index <= SLOTS_8B; index++) {
+		slots8b[index] = arenaSlab_alloc(allocator, 8);
+		CHECK(slots8b[index] != NULL);
+		memset(slots8b[index], 0xCD, 8); /* revived payload writable */
+	}
+	for (uint32_t index = 0; index <= SLOTS_8B; index++) {
+		CHECK(arenaSlab_free(allocator, slots8b[index]) == true);
 	}
 }
 
 /* ---- many arenas per class: carve, chain walk, partial reuse ---- */
 static void testChainReuse(ArenaSlabAllocator* allocator) {
 	section("chain reuse (3 arenas x 32B class)");
-	/* 24B lands in the 32B class; one 32B arena holds 509 payload slots, so 1500 spans 3 arenas */
+	/* 24B lands in the 32B class; one 32B arena holds 511 payload slots, so 1500 spans 3 arenas */
 	enum { COUNT = 1500 };
 	static void* slots[COUNT];
 
@@ -297,70 +327,71 @@ static void testChurn(ArenaSlabAllocator* allocator) {
 	for (uint32_t index = 0; index < CHURN_SLOTS; index++) {
 		CHECK(arenaSlab_free(allocator, churnPointers[index]) == true);
 	}
-	CHECK(arenaSlab_free(allocator, churnPointers[0]) == false); /* everything already free */
+	/* NOTE: churnPointers[0] was already freed above — a second free would corrupt the freelist */
 }
 
-/* ---- trim drops empty arenas; dropped arenas must come back usable ---- */
-static void testTrimAndReuse(ArenaSlabAllocator* allocator) {
-	section("trim + dropped-arena reuse");
-	/* 16B arena: 1024 slots - 10 header slots = 1014 payload slots */
-	enum { ARENAS = 5, SLOTS_PER_ARENA = 1014 };
-	void* slots[ARENAS * SLOTS_PER_ARENA];
-	const uint32_t count = ARENAS * SLOTS_PER_ARENA;
-
-	/* per-arena dropped size: everything past the first page; 0 on 16KB-page systems */
-	uint32_t pageSize = osPageSize();
-	size_t dropLength = (pageSize < ARENA_SIZE_SMALL) ? (size_t)(ARENA_SIZE_SMALL - pageSize) : 0;
-
-	/* baseline: empty arenas left over from the earlier tests must not skew the count below */
-	(void)arenaSlab_trim(allocator, TRIM_KEEP_EMPTY_DEFAULT);
-
-	for (uint32_t index = 0; index < count; index++) {
-		slots[index] = arenaSlab_alloc(allocator, 16);
-		CHECK(slots[index] != NULL);
-	}
-	for (uint32_t index = 0; index < count; index++) {
-		CHECK(arenaSlab_free(allocator, slots[index]) == true);
-	}
-
-	size_t dropped = arenaSlab_trim(allocator, TRIM_KEEP_EMPTY_DEFAULT);
-	printf("  trim dropped %llu bytes\n", (unsigned long long)dropped);
-	CHECK(dropped == (size_t)(ARENAS - TRIM_KEEP_EMPTY_DEFAULT) * dropLength); /* 5 empties: 2 head-most kept warm, the rest dropped */
-
-	/* the dropped arenas must return through the shared free-chain, fully writable */
-	for (uint32_t index = 0; index < count; index++) {
-		slots[index] = arenaSlab_alloc(allocator, 16);
-		CHECK(slots[index] != NULL);
-	}
-	for (uint32_t index = 0; index < count; index++) {
-		memset(slots[index], 0xCD, 16);
-	}
-	for (uint32_t index = 0; index < count; index++) {
-		CHECK(arenaSlab_free(allocator, slots[index]) == true);
-	}
-
-	/* knob edges: keep=huge drops nothing, keep=0 sweeps every class's empties — our five
-	 * 16B arenas plus the warm reserves the earlier tests left in the other classes */
-	CHECK(arenaSlab_trim(allocator, UINT32_MAX) == 0);
-	size_t droppedAll = arenaSlab_trim(allocator, 0);
-	printf("  trim(0) dropped %llu bytes\n", (unsigned long long)droppedAll);
-	CHECK(droppedAll >= (size_t)ARENAS * dropLength);
-}
-
-/* ---- cross-size reuse: shells trimmed from one class must serve another ---- */
-static void testCrossSizeReuse(void) {
-	section("cross-size shell reuse (256B shells -> 16B class)");
-	/* dedicated instance so the free-chain state is fully controlled */
+/* ---- free parks emptied arenas into the resident ring; the ring revives them for free ---- */
+static void testTrimAndReuse(void) {
+	section("trim + resident-ring reuse");
+	/* dedicated instance so the ring level is fully controlled */
 	ArenaSlabAllocator allocator;
 	memset(&allocator, 0, sizeof(allocator));
 	CHECK(arenaSlab_init(&allocator, SEGMENT_SIZE_EXPONENT_DEFAULT) == true);
 
-	uint32_t pageSize = osPageSize();
-	size_t dropLength = (pageSize < ARENA_SIZE_SMALL) ? (size_t)(ARENA_SIZE_SMALL - pageSize) : 0;
-	(void)dropLength; /* asserted through the trim counts below on sub-16KB-page systems */
+	/* 16B arena: 1024 slots - 2 header slots = 1022 payload slots */
+	enum { ARENAS = 5, SLOTS_PER_ARENA = 1022 };
+	void* slots[ARENAS * SLOTS_PER_ARENA];
+	const uint32_t count = ARENAS * SLOTS_PER_ARENA;
 
-	/* 256B phase: fill four arenas (4 x 63 slots), free everything, trim -> two head-most
-	 * stay warm, two shells move to the shared free-chain */
+	for (uint32_t index = 0; index < count; index++) {
+		slots[index] = arenaSlab_alloc(&allocator, 16);
+		CHECK(slots[index] != NULL);
+	}
+	for (uint32_t index = 0; index < count; index++) {
+		CHECK(arenaSlab_free(&allocator, slots[index]) == true);
+	}
+
+	/* free keeps the first CLASS_SPARE_KEEP empties of the class linked as warm spares;
+	 * the rest park into the resident ring — far below the water mark, trim drops
+	 * nothing (no syscall, the pages stay committed) */
+	CHECK(allocator.segment.residentCount == ARENAS - CLASS_SPARE_KEEP);
+	printf("  ring holds %u shells, trim dropped %llu bytes\n",
+		(unsigned)(ARENAS - CLASS_SPARE_KEEP), (unsigned long long)arenaSlab_trim(&allocator));
+	CHECK(allocator.segment.residentCount == ARENAS - CLASS_SPARE_KEEP);
+
+	/* the parked shells must revive through the ring head, fully writable, with no
+	 * page-reuse syscall (revive-chain shells would pay osPagesReuse) */
+#ifdef LOG_MALLOC_STATS
+	size_t reuseCallsBefore = allocator.stats.reuseCalls;
+#endif
+	for (uint32_t index = 0; index < count; index++) {
+		slots[index] = arenaSlab_alloc(&allocator, 16);
+		CHECK(slots[index] != NULL);
+	}
+#ifdef LOG_MALLOC_STATS
+	CHECK(allocator.stats.reuseCalls == reuseCallsBefore); /* ring revival: no reuse */
+#endif
+	for (uint32_t index = 0; index < count; index++) {
+		memset(slots[index], 0xCD, 16);
+	}
+	for (uint32_t index = 0; index < count; index++) {
+		CHECK(arenaSlab_free(&allocator, slots[index]) == true);
+	}
+	CHECK(allocator.segment.residentCount == ARENAS - CLASS_SPARE_KEEP); /* 2 spares re-linked, rest re-parked */
+
+	arenaSlab_shutdown(&allocator);
+}
+
+/* ---- cross-size reuse: shells parked by free must serve another class ---- */
+static void testCrossSizeReuse(void) {
+	section("cross-size shell reuse (256B shells -> 16B class)");
+	/* dedicated instance so the ring state is fully controlled */
+	ArenaSlabAllocator allocator;
+	memset(&allocator, 0, sizeof(allocator));
+	CHECK(arenaSlab_init(&allocator, SEGMENT_SIZE_EXPONENT_DEFAULT) == true);
+
+	/* 256B phase: fill four arenas (4 x 63 slots), free everything — free parks all four
+	 * into the resident ring with pages RESIDENT (no trim, no syscall involved) */
 	enum { COUNT_256B = 4 * 63 };
 	static void* big[COUNT_256B];
 	uintptr_t rangeMin = ~(uintptr_t)0;
@@ -377,13 +408,17 @@ static void testCrossSizeReuse(void) {
 	for (uint32_t index = 0; index < COUNT_256B; index++) {
 		CHECK(arenaSlab_free(&allocator, big[index]) == true);
 	}
-	CHECK(arenaSlab_trim(&allocator, TRIM_KEEP_EMPTY_DEFAULT) == 2 * dropLength); /* 4 empties - 2 warm */
+	/* two warm spares stay LINKED on the 256B chain; the other two park into the ring */
+	CHECK(allocator.segment.residentCount == 4 - CLASS_SPARE_KEEP);
 
-	/* 16B phase: the 16B class chain is empty, so the shells must be revived cross-size —
-	 * every new slot must land inside the old 256B arena blocks (a fresh carve would sit
-	 * beyond the old frontier and fail this check) */
-	enum { COUNT_16B = 2 * 1014 };
+	/* 16B phase: the 16B class chain is empty, so the shells must be revived cross-size
+	 * from the ring head — every new slot must land inside the old 256B arena blocks
+	 * (a fresh carve would sit beyond the old frontier and fail this check) */
+	enum { COUNT_16B = 2 * 1022 };
 	static void* small[COUNT_16B];
+#ifdef LOG_MALLOC_STATS
+	size_t reuseCallsBefore = allocator.stats.reuseCalls;
+#endif
 	for (uint32_t index = 0; index < COUNT_16B; index++) {
 		small[index] = arenaSlab_alloc(&allocator, 16);
 		CHECK(small[index] != NULL);
@@ -393,53 +428,88 @@ static void testCrossSizeReuse(void) {
 			memset(small[index], 0xCD, 16); /* revived payload pages must be writable */
 		}
 	}
+#ifdef LOG_MALLOC_STATS
+	CHECK(allocator.stats.reuseCalls == reuseCallsBefore); /* ring revival: no reuse */
+#endif
 	for (uint32_t index = 0; index < COUNT_16B; index++) {
 		CHECK(arenaSlab_free(&allocator, small[index]) == true);
 	}
+	/* the revived arenas become the 16B class's warm spares (staying linked) — the ring
+	 * is empty now: the two parked 256B shells were consumed by the revival */
+	CHECK(allocator.segment.residentCount == 0);
 
 	arenaSlab_shutdown(&allocator);
 }
 
-/* ---- trim regression: a dropped arena at a chain head must not block later classes ---- */
-static void testTrimDroppedHead(void) {
-	section("trim: dropped chain head does not block later classes");
-	/* dedicated instance so the chain states are fully controlled */
+/* ---- trim water mark: the resident ring keeps at most TRIM_POOL_MAX_RESIDENT shells;
+ * revival from the ring head is free, the dropped cold tail pays one reuse each ---- */
+static void testTrimHighWater(void) {
+	section("trim water mark");
+	/* dedicated instance so the ring level is fully controlled */
 	ArenaSlabAllocator allocator;
 	memset(&allocator, 0, sizeof(allocator));
 	CHECK(arenaSlab_init(&allocator, SEGMENT_SIZE_EXPONENT_DEFAULT) == true);
 
-	/* per-arena dropped size: everything past the first page; 0 on 16KB-page systems */
 	uint32_t pageSize = osPageSize();
 	size_t dropLength = (pageSize < ARENA_SIZE_SMALL) ? (size_t)(ARENA_SIZE_SMALL - pageSize) : 0;
 
-	/* 16B: fill exactly two arenas, free everything, trim -> the 16B chain head is dropped */
-	enum { COUNT_16B = 2 * 1014 };
-	static void* slots[COUNT_16B];
-	for (uint32_t index = 0; index < COUNT_16B; index++) {
+	/* fill 320 arenas, free everything: free keeps the first CLASS_SPARE_KEEP empties
+	 * linked as warm spares and parks the rest into the resident ring (no syscall),
+	 * then trim drops exactly the coldest shells beyond the water mark */
+	enum { ARENA_COUNT = 320, SLOTS = 1022 };
+	enum { COUNT = ARENA_COUNT * SLOTS };
+	static void* slots[COUNT];
+	for (uint32_t index = 0; index < COUNT; index++) {
 		slots[index] = arenaSlab_alloc(&allocator, 16);
 		CHECK(slots[index] != NULL);
 	}
-	for (uint32_t index = 0; index < COUNT_16B; index++) {
+	for (uint32_t index = 0; index < COUNT; index++) {
 		CHECK(arenaSlab_free(&allocator, slots[index]) == true);
 	}
-	CHECK(arenaSlab_trim(&allocator) == 2 * dropLength);
+	CHECK(allocator.segment.residentCount == ARENA_COUNT - CLASS_SPARE_KEEP);
+	CHECK(arenaSlab_trim(&allocator) == (size_t)(ARENA_COUNT - CLASS_SPARE_KEEP - TRIM_POOL_MAX_RESIDENT) * dropLength);
+	CHECK(allocator.segment.residentCount == TRIM_POOL_MAX_RESIDENT);
 
-	/* 32B: one arena touched and emptied again -> newly droppable, but trim only reaches
-	 * it by walking past the dropped 16B chain head */
-	enum { COUNT_32B = 8 };
-	void* smallSlots[COUNT_32B];
-	for (uint32_t index = 0; index < COUNT_32B; index++) {
-		smallSlots[index] = arenaSlab_alloc(&allocator, 32);
-		CHECK(smallSlots[index] != NULL);
-	}
-	for (uint32_t index = 0; index < COUNT_32B; index++) {
-		CHECK(arenaSlab_free(&allocator, smallSlots[index]) == true);
-	}
-
-	/* old bug: trim bailed out at the dropped 16B head and never reached the 32B class */
-	CHECK(arenaSlab_trim(&allocator) == dropLength);
-	CHECK(arenaSlab_trim(&allocator) == 0); /* everything already dropped: skip-all walk */
+	/* idempotent: the second trim drops nothing (the ring sits exactly at the water mark) */
 	CHECK(arenaSlab_trim(&allocator) == 0);
+
+	/* revival order, arena-aligned phases: the CLASS_SPARE_KEEP chain spares revive first,
+	 * then the 256 ring-head shells — none may pay a reuse; each of the dropped tail
+	 * shells pays exactly one reuse when its first slot is claimed */
+	enum { SPARE_PHASE = CLASS_SPARE_KEEP * SLOTS };
+	enum { RING_PHASE = TRIM_POOL_MAX_RESIDENT * SLOTS };
+	enum { DROPPED_COUNT = ARENA_COUNT - CLASS_SPARE_KEEP - TRIM_POOL_MAX_RESIDENT };
+	enum { DROPPED_PHASE = DROPPED_COUNT * SLOTS };
+#ifdef LOG_MALLOC_STATS
+	size_t reuseCallsBefore = allocator.stats.reuseCalls;
+	size_t reuseBytesBefore = allocator.stats.reuseBytes;
+#endif
+	for (uint32_t index = 0; index < SPARE_PHASE; index++) {
+		slots[index] = arenaSlab_alloc(&allocator, 16);
+		CHECK(slots[index] != NULL);
+	}
+#ifdef LOG_MALLOC_STATS
+	CHECK(allocator.stats.reuseCalls == reuseCallsBefore); /* spare revival: no reuse */
+#endif
+	for (uint32_t index = SPARE_PHASE; index < SPARE_PHASE + RING_PHASE; index++) {
+		slots[index] = arenaSlab_alloc(&allocator, 16);
+		CHECK(slots[index] != NULL);
+	}
+#ifdef LOG_MALLOC_STATS
+	CHECK(allocator.stats.reuseCalls == reuseCallsBefore); /* ring revival: no reuse */
+#endif
+	for (uint32_t index = SPARE_PHASE + RING_PHASE; index < SPARE_PHASE + RING_PHASE + DROPPED_PHASE; index++) {
+		slots[index] = arenaSlab_alloc(&allocator, 16);
+		CHECK(slots[index] != NULL);
+	}
+#ifdef LOG_MALLOC_STATS
+	CHECK(allocator.stats.reuseCalls == reuseCallsBefore + DROPPED_COUNT);
+	CHECK(allocator.stats.reuseBytes == reuseBytesBefore + (size_t)DROPPED_COUNT * dropLength);
+#endif
+	for (uint32_t index = 0; index < SPARE_PHASE + RING_PHASE + DROPPED_PHASE; index++) {
+		CHECK(arenaSlab_free(&allocator, slots[index]) == true);
+	}
+	CHECK(allocator.segment.residentCount == ARENA_COUNT - CLASS_SPARE_KEEP); /* 2 spares re-linked, rest re-parked */
 
 	arenaSlab_shutdown(&allocator);
 }
@@ -458,7 +528,7 @@ static void testRealloc(ArenaSlabAllocator* allocator) {
 	CHECK(bigger != NULL && bigger != small);
 	CHECK(arenaSlab_usable_size(allocator, bigger) == 128);
 	for (int index = 0; index < 16; index++) CHECK(bigger[index] == (unsigned char)index);
-	CHECK(arenaSlab_free(allocator, small) == false); /* realloc already freed it */
+	/* NOTE: `small` was freed by realloc — a second free would corrupt the freelist */
 
 	CHECK(arenaSlab_realloc(allocator, bigger, 32) == bigger); /* shrink keeps the pointer */
 
@@ -467,10 +537,65 @@ static void testRealloc(ArenaSlabAllocator* allocator) {
 	CHECK(arenaSlab_usable_size(allocator, fresh) == 32);
 
 	CHECK(arenaSlab_realloc(allocator, bigger, 0) == NULL); /* acts as free */
-	CHECK(arenaSlab_free(allocator, bigger) == false);
 
 	CHECK(arenaSlab_realloc(allocator, fresh, 4096) == NULL); /* oversize: freed + NULL */
-	CHECK(arenaSlab_free(allocator, fresh) == false);
+
+	/* 8B leg: growing crosses the class boundary (pointer moves, content survives);
+	 * shrinking back keeps the slot and its 16B usable size (shrink never reclassifies) */
+	unsigned char* tiny = static_cast<unsigned char*>(arenaSlab_alloc(allocator, 8));
+	CHECK(tiny != NULL);
+	for (int index = 0; index < 8; index++) tiny[index] = (unsigned char)(index + 0x40);
+	unsigned char* grown = static_cast<unsigned char*>(arenaSlab_realloc(allocator, tiny, 16));
+	CHECK(grown != NULL && grown != tiny); /* 8B -> 16B class: must move */
+	for (int index = 0; index < 8; index++) CHECK(grown[index] == (unsigned char)(index + 0x40));
+	CHECK(arenaSlab_usable_size(allocator, grown) == 16);
+	CHECK(arenaSlab_realloc(allocator, grown, 8) == grown); /* shrink keeps the pointer */
+	CHECK(arenaSlab_usable_size(allocator, grown) == 16);
+	CHECK(arenaSlab_free(allocator, grown) == true);
+}
+
+/* ---- calloc: zero-fill, overflow, zero total; the size gate ---- */
+static void testCalloc(ArenaSlabAllocator* allocator) {
+	section("calloc + permissible_size");
+
+	/* basic zero-fill: whatever slot comes back (fresh bump or reused freelist head),
+	 * calloc must hand out zeros */
+	unsigned char* written = static_cast<unsigned char*>(arenaSlab_alloc(allocator, 64));
+	CHECK(written != NULL);
+	memset(written, 0xA7, 64);
+	CHECK(arenaSlab_free(allocator, written) == true);
+	unsigned char* zeroed = static_cast<unsigned char*>(arenaSlab_calloc(allocator, 1, 64));
+	CHECK(zeroed != NULL);
+	if (zeroed != NULL) {
+		CHECK(arenaSlab_usable_size(allocator, zeroed) == 64);
+		for (int index = 0; index < 64; index++) CHECK(zeroed[index] == 0);
+	}
+	CHECK(arenaSlab_free(allocator, zeroed) == true);
+
+	/* multi-element zero-fill at the exact class limit */
+	void* grid = arenaSlab_calloc(allocator, 8, 32); /* 256B exactly */
+	CHECK(grid != NULL);
+	if (grid != NULL) {
+		CHECK(arenaSlab_usable_size(allocator, grid) == 256);
+		for (int index = 0; index < 256; index++) CHECK(static_cast<unsigned char*>(grid)[index] == 0);
+	}
+	CHECK(arenaSlab_free(allocator, grid) == true);
+
+	/* overflow and oversize reject; zero total follows alloc's size-0 rule */
+	CHECK(arenaSlab_calloc(allocator, (size_t)-1, 16) == NULL); /* count * size overflows */
+	CHECK(arenaSlab_calloc(allocator, 32, 16) == NULL);         /* 512B: over the class limit */
+	CHECK(arenaSlab_calloc(allocator, 0, 0) != NULL);           /* zero total: alloc's size-0 rule */
+	CHECK(arenaSlab_calloc(allocator, 16, 0) != NULL);          /* ditto */
+
+	/* the size gate: alloc's and realloc's shared domain */
+	CHECK(arenaSlab_permissible_size(0) == true);
+	CHECK(arenaSlab_permissible_size(1) == true);
+	CHECK(arenaSlab_permissible_size(256) == true);
+	CHECK(arenaSlab_permissible_size(257) == false);
+	CHECK(arenaSlab_permissible_size((size_t)-1) == false);
+
+	/* foreign / NULL contexts stay rejected through calloc */
+	CHECK(arenaSlab_calloc(NULL, 1, 8) == NULL);
 }
 
 /* ---- foreign pointers must be rejected without touching the allocator ---- */
@@ -516,6 +641,21 @@ static void testInteriorPointerRejection(ArenaSlabAllocator* allocator) {
 	CHECK(arenaSlab_free(allocator, (void*)(arenaBase + ARENA_SIZE_SMALL - 1)) == false); /* arena tail byte */
 
 	CHECK(arenaSlab_free(allocator, slot) == true); /* the real slot still frees */
+
+	/* 8B geometry: the header spans 4 slots (32B) — aligned frees of header slots 1..3
+	 * must be rejected by the merged bounds check. Slot 4 is the first payload slot and
+	 * is deliberately NOT freed here (freeing an unallocated slot corrupts the freelist) */
+	void* slot8 = arenaSlab_alloc(allocator, 8);
+	CHECK(slot8 != NULL);
+	if (slot8 != NULL) {
+		uintptr_t arenaBase8 = (uintptr_t)slot8 & ~(uintptr_t)(ARENA_SIZE_SMALL - 1);
+		CHECK(arenaSlab_which(allocator, (void*)(arenaBase8 + 40)) == SLAB_LAYER_SMALL); /* payload range: SMALL by range */
+		CHECK(arenaSlab_free(allocator, (void*)(arenaBase8 + 8)) == false);   /* header slot 1 */
+		CHECK(arenaSlab_free(allocator, (void*)(arenaBase8 + 16)) == false);  /* header slot 2 */
+		CHECK(arenaSlab_free(allocator, (void*)(arenaBase8 + 24)) == false);  /* header slot 3 */
+		CHECK(arenaSlab_free(allocator, (void*)(arenaBase8 + 25)) == false);  /* misaligned */
+		CHECK(arenaSlab_free(allocator, slot8) == true); /* the real 8B slot frees */
+	}
 }
 
 /* ---- two-instance isolation: one allocator must never accept the other's pointers ---- */
@@ -546,12 +686,12 @@ static void testCrossInstanceIsolation(void) {
 /* ---- single-segment semantics: 1MB, no growth, exhaustion, revive ---- */
 static void testSingleSegmentCapacity(void) {
 	section("1MB segment capacity");
-	/* 1MB = 64 arenas of 16KB; 16B arena holds 1014 slots -> 64 * 1014 = 64896 slots max */
+	/* 1MB = 64 arenas of 16KB; 16B arena holds 1022 slots -> 64 * 1022 = 65408 slots max */
 	ArenaSlabAllocator allocator;
 	memset(&allocator, 0, sizeof(allocator));
 	CHECK(arenaSlab_init(&allocator, SEGMENT_SIZE_EXPONENT_MIN) == true);
 
-	enum { TOTAL_16B_SLOTS = 64 * 1014 };
+	enum { TOTAL_16B_SLOTS = 64 * 1022 };
 	static void* slots[TOTAL_16B_SLOTS];
 	uint32_t allocated = 0;
 	for (;;) {
@@ -560,7 +700,7 @@ static void testSingleSegmentCapacity(void) {
 		slots[allocated++] = slot;
 	}
 	printf("  1MB segment held %u x 16B slots\n", allocated);
-	CHECK(allocated == 64 * 1014);
+	CHECK(allocated == 64 * 1022);
 
 	/* exhausted: every other class must fail too (no cross-class, no cross-segment growth) */
 	CHECK(arenaSlab_alloc(&allocator, 256) == NULL);
@@ -609,9 +749,11 @@ static void runArenaSlabTests(void) {
 	testClassBasics(&allocator);
 	testChainReuse(&allocator);
 	testChurn(&allocator);
-	testTrimAndReuse(&allocator);
+	testTrimAndReuse();
 	testCrossSizeReuse();
+	testTrimHighWater();
 	testRealloc(&allocator);
+	testCalloc(&allocator);
 	testForeignPointers(&allocator, segmentExponent);
 	testInteriorPointerRejection(&allocator);
 	testCrossInstanceIsolation();
@@ -830,8 +972,8 @@ static void benchCarve(void) {
 		printf("  carve bench skipped (init failed)\n");
 		return;
 	}
-	const uint32_t total = BENCH_CARVE_ARENAS * 1014; /* payload slots per 16B arena */
-	static void* pointers[BENCH_CARVE_ARENAS * 1014];
+	const uint32_t total = BENCH_CARVE_ARENAS * 1022; /* payload slots per 16B arena */
+	static void* pointers[BENCH_CARVE_ARENAS * 1022];
 
 	uintptr_t sink = 0;
 	double start = benchNow();
@@ -853,39 +995,41 @@ static void benchCarve(void) {
 }
 
 static void benchTrimCycle(void) {
-	/* dedicated instance: measures drop + reuse around trim */
+	/* dedicated instance: measures drop + reuse around trim; the per-cycle arena count
+	 * must exceed TRIM_POOL_MAX_RESIDENT so every trim actually drops the cold tail */
 	ArenaSlabAllocator allocator;
 	memset(&allocator, 0, sizeof(allocator));
 	if (!arenaSlab_init(&allocator, SEGMENT_SIZE_EXPONENT_DEFAULT)) {
 		printf("  trim bench skipped (init failed)\n");
 		return;
 	}
-	enum { SLOTS = 5 * 1014 }; /* 5 arenas of 16B slots */
-	void* slots[SLOTS];
+	enum { ARENAS = TRIM_POOL_MAX_RESIDENT + 64, SLOTS = 1022 };
+	static void* slots[ARENAS * SLOTS];
 
 	double start = benchNow();
 	for (uint32_t cycle = 0; cycle < BENCH_TRIM_CYCLES; cycle++) {
-		for (uint32_t index = 0; index < SLOTS; index++) slots[index] = arenaSlab_alloc(&allocator, 16);
-		for (uint32_t index = 0; index < SLOTS; index++) arenaSlab_free(&allocator, slots[index]);
-		(void)arenaSlab_trim(&allocator, TRIM_KEEP_EMPTY_DEFAULT);
+		for (uint32_t index = 0; index < ARENAS * SLOTS; index++) slots[index] = arenaSlab_alloc(&allocator, 16);
+		for (uint32_t index = 0; index < ARENAS * SLOTS; index++) arenaSlab_free(&allocator, slots[index]);
+		(void)arenaSlab_trim(&allocator);
 	}
-	uint64_t operations = (uint64_t)BENCH_TRIM_CYCLES * (2 * (uint64_t)SLOTS + 1);
+	uint64_t operations = (uint64_t)BENCH_TRIM_CYCLES * (2 * (uint64_t)(ARENAS * SLOTS) + 1);
 	benchReport("trim cycle (alloc/free/trim x3)", operations, benchNow() - start);
 
 	arenaSlab_shutdown(&allocator);
 }
 
 /* adversarial pattern: frees cluster at the top of one arena and are re-claimed right away;
- * probes the recent-free hint (a scan from word 0 would walk nearly the whole bitmap) */
+ * probes the LIFO free list (the hottest slots sit at the list head, so every claim is a
+ * pure pop — the bump tail is never touched) */
 static void benchRecentFree(void) {
-	/* dedicated instance: isolates one 16B arena and its hint */
+	/* dedicated instance: isolates one 16B arena and its freelist */
 	ArenaSlabAllocator allocator;
 	memset(&allocator, 0, sizeof(allocator));
 	if (!arenaSlab_init(&allocator, SEGMENT_SIZE_EXPONENT_DEFAULT)) {
 		printf("  recent-free bench skipped (init failed)\n");
 		return;
 	}
-	enum { ARENA_FILL = 1014, HOT = 100, CYCLES = 200000 };
+	enum { ARENA_FILL = 1022, HOT = 100, CYCLES = 200000 };
 	static void* slots[ARENA_FILL];
 
 	for (uint32_t index = 0; index < ARENA_FILL; index++) slots[index] = arenaSlab_alloc(&allocator, 16);
@@ -1021,7 +1165,7 @@ static void runUsePhaseCell(BenchTarget* targets, std::vector<void*>& slots, dou
 }
 
 static void runUsePhaseBench(BenchTarget* targets) {
-	static const size_t sizes[] = { 16, 64, 256 };
+	static const size_t sizes[] = { 8, 16, 64, 256 };
 	static const size_t tierBytes[] = { (size_t)1 << 20, (size_t)32 << 20, (size_t)512 << 20 };
 	static const uint32_t tierPasses[] = { 1024, 32, 1 };
 	static const char* tierNames[] = { "1MB", "32MB", "512MB" };
@@ -1051,7 +1195,8 @@ static void runUsePhaseBench(BenchTarget* targets) {
 			 * memory lazily too, and trim is a manual safe-point operation by design —
 			 * calling it every cell would hand arenaSlab a syscall-driven page-return
 			 * cost (and a MEM_RESET hangover) the others never pay. Freed arenas stay
-			 * cached in the partial chains, which is the matching deferred-return behavior. */
+			 * cached on their chains as warm spares (plus the ring), which is the
+			 * matching deferred-return behavior. */
 		}
 	}
 }
@@ -1059,7 +1204,7 @@ static void runUsePhaseBench(BenchTarget* targets) {
 /* ---- unified comparison: three allocators under identical load patterns ---- */
 static void runBenchComparison(ArenaSlabAllocator* allocator) {
 	/* arenaSlab serves 16/32/64/128/256 only, so those class sizes are the common ground */
-	static const size_t sizes[] = { 16, 32, 64, 128, 256 };
+	static const size_t sizes[] = { 8, 16, 32, 64, 128, 256 };
 	char name[64];
 	double seconds[3];
 
@@ -1111,7 +1256,8 @@ static void runBenches(void) {
 	benchRecentFree();
 	printf("  anti-optimization checksum: %llx\n", (unsigned long long)benchSink);
 
-	/* stats dump: arena_slab.h always defines LOG_MALLOC_STATS, so the stats API is always present */
+	/* stats dump: only compiled in with LOG_MALLOC_STATS (Debug builds) — in Release the
+	 * dump is a no-op and this section just exercises the gate paths */
 	section("stats dump");
 	CHECK(arenaSlab_init(&allocator, SEGMENT_SIZE_EXPONENT_DEFAULT) == true);
 	void* statsPointer = arenaSlab_alloc(&allocator, 64);
@@ -1119,23 +1265,54 @@ static void runBenches(void) {
 	(void)arenaSlab_trim(&allocator, TRIM_KEEP_EMPTY_DEFAULT);
 	arenaSlab_dumpStats(&allocator);
 	arenaSlab_statsReset(&allocator);
+
+	/* full-arena visibility: 255 x 64B fill one arena exactly (it leaves the chain full),
+	 * the next slot opens a second partial arena — State must report full 1 */
+	void* fullFill[255];
+	for (uint32_t index = 0; index < 255; index++) fullFill[index] = arenaSlab_alloc(&allocator, 64);
+	CHECK(fullFill[254] != NULL);
+	void* partialSlot = arenaSlab_alloc(&allocator, 64);
+	CHECK(partialSlot != NULL);
+	arenaSlab_dumpStats(&allocator);
+	arenaSlab_statsReset(&allocator);
+	for (uint32_t index = 0; index < 255; index++) CHECK(arenaSlab_free(&allocator, fullFill[index]) == true);
+	CHECK(arenaSlab_free(&allocator, partialSlot) == true);
 	arenaSlab_shutdown(&allocator);
 }
 
-int main() {
+int main(int argc, char** argv) {
+	setvbuf(stdout, NULL, _IONBF, 0); /* crash-safe diagnostics: no lost output on exceptions */
 	size_t sizes[] = { 8, 12, 16, 20, 24, 28, 32, 40, 48, 56, 64, 80, 96, 112, 128, 192, 256 };
 
-	// FixedAllocator correctness tests
-	for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); ++i) {
-		test_allocation_correctness(sizes[i], 100000);
-		std::cout << std::endl;
+	bool runCorrectness = true;
+	bool runThroughput = true;
+	for (int i = 1; i < argc; i++) {
+		if (strcmp(argv[i], "--test") == 0) runThroughput = false;
+		else if (strcmp(argv[i], "--bench") == 0) runCorrectness = false;
+		else {
+			printf("usage: slabAlloc [--test | --bench]\n"
+				"  (no arg)  correctness tests + benchmarks\n"
+				"  --test    correctness tests only, no throughput\n"
+				"  --bench   benchmarks only\n");
+			return 2;
+		}
 	}
 
-	// arenaSlab test suite
-	runArenaSlabTests();
+	if (runCorrectness) {
+		// FixedAllocator correctness tests
+		for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); ++i) {
+			test_allocation_correctness(sizes[i], 100000);
+			std::cout << std::endl;
+		}
 
-	// Benchmarks: three allocators under identical load patterns
-	runBenches();
+		// arenaSlab test suite
+		runArenaSlabTests();
+	}
+
+	if (runThroughput) {
+		// Benchmarks: three allocators under identical load patterns
+		runBenches();
+	}
 
 	printf("== %s (%d failures) ==\n",
 		testFailures == 0 ? "ALL TESTS PASSED" : "TESTS FAILED", testFailures);

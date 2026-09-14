@@ -86,23 +86,31 @@ allocator.print_stats();
 `src/arena_slab.h` / `src/arena_slab.c` implement a second, independent allocator tuned for
 small objects (≤ 256 bytes). It sits on top of raw kernel VM primitives
 (`src/palloc_os.c`: `mmap`/`mprotect`/`madvise` on POSIX, `VirtualAlloc`/`VirtualFree` on
-Windows) — no libc allocator is involved. The bitmap helpers (`src/bits.h`, `src/bits.c`)
-are taken from Slab-Allocator (MIT License, Copyright (c) 2026 IMSDcrueoft).
+Windows) — no libc allocator is involved. The bit-manipulation helpers (`src/bits.h`,
+`src/bits.c`: ctz/clz/popcnt) are taken from Slab-Allocator (MIT License, Copyright (c) 2026
+IMSDcrueoft).
 
 ### Design Highlights
 
 - **Single segment**: one virtual address reservation per allocator, sized `1 << exponent`
   (valid range 1MB … 1TB; the default instance uses 4GB). There is **no automatic growth**:
   once the segment is exhausted, `alloc` returns `NULL` until `free`/`trim` reclaim space.
-- **5 slot classes** (16/32/64/128/256 bytes) served from 16KB slab arenas that are carved
+- **6 slot classes** (8/16/32/64/128/256 bytes) served from 16KB slab arenas that are carved
   and committed on demand. Requests larger than 256 bytes return `NULL` (caller's responsibility).
 - **Deterministic O(1) free path**: ownership is resolved via arena headers plus a segment
-  range check; allocation scans a bitmap (`bit = 1` free) with `ctz`, lowest slot first.
-- **16-byte aligned** returned pointers; `arenaSlab_usable_size` reports the slot class size.
-  Size 0 is treated as 16; double frees and foreign pointers are rejected.
-- **Lazy return**: `arenaSlab_trim` drops the pages of empty arenas back to the OS
-  (metadata and the header page are always kept). It is never called automatically —
-  call it from safe points.
+  range check; each arena serves allocation bump-style from its never-used tail and reuses
+  freed slots through a LIFO free list (next pointer stored in the slot itself, head in the
+  header) — no scan, no threading pass, O(1) always.
+- **Aligned** returned pointers: 8-byte for the 8B class, 16-byte for every other class;
+  `arenaSlab_usable_size` reports the slot class size. Size 0 is treated as 8; foreign
+  pointers are rejected. Double frees are **not** detected
+  (freed slot memory doubles as freelist state — writing into a freed slot is undefined).
+- **Lazy return, two-phase**: `free` keeps the first `CLASS_SPARE_KEEP` (2) emptied arenas
+  of a class linked as warm spares — the pair pattern re-claims them straight off the chain
+  head — and parks every beyond-quota empty into a cross-class ring (O(1), pages stay
+  committed, revival is free); `arenaSlab_trim` returns the pages of the ring's coldest
+  shells beyond a 4MB water mark to the OS (the header page is always kept). It is never
+  called automatically — call it from safe points.
 - **Single-threaded, lock-free** by design.
 - **Optional statistics**: build with `LOG_MALLOC_STATS` to enable counters and
   `arenaSlab_dumpStats` / `arenaSlab_statsReset`.
