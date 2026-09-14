@@ -24,6 +24,12 @@
     <ClCompile Include="src\bits.c">
       <Filter>src</Filter>
     </ClCompile>
+    <ClCompile Include="src\arena_slab.c">
+      <Filter>src</Filter>
+    </ClCompile>
+    <ClCompile Include="src\palloc_os.c">
+      <Filter>src</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\objectPool.hpp">
@@ -33,6 +39,12 @@
       <Filter>src</Filter>
     </ClInclude>
     <ClInclude Include="src\slab.h">
+      <Filter>src</Filter>
+    </ClInclude>
+    <ClInclude Include="src\arena_slab.h">
+      <Filter>src</Filter>
+    </ClInclude>
+    <ClInclude Include="src\palloc_os.h">
       <Filter>src</Filter>
     </ClInclude>
   </ItemGroup>
