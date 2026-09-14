@@ -717,6 +717,122 @@ static void benchRecentFree(void) {
 	benchSink ^= sink;
 }
 
+/* ---- use-phase bench: the layout impact of memory once it is actually used ----
+ * Alloc/free are deliberately excluded (phase separated); only the traversal of live
+ * objects is timed. Footprint tiers: 1MB (L2), 32MB (L3, chip-dependent), 512MB (DRAM):
+ * layout differences only show up once the footprint leaves the caches. */
+
+static uint64_t useGcd(uint64_t a, uint64_t b) {
+	while (b != 0) { uint64_t t = a % b; a = b; b = t; }
+	return a;
+}
+
+static double benchUseLinearRead(void** slots, size_t count, uint32_t passes) {
+	uint64_t sink = 0;
+	double start = benchNow();
+	for (uint32_t pass = 0; pass < passes; pass++) {
+		for (size_t index = 0; index < count; index++) {
+			sink += *static_cast<uint64_t*>(slots[index]);
+		}
+	}
+	benchSink ^= sink;
+	return benchNow() - start;
+}
+
+static double benchUseLinearRw(void** slots, size_t count, uint32_t passes) {
+	uint64_t sink = 0;
+	double start = benchNow();
+	for (uint32_t pass = 0; pass < passes; pass++) {
+		uint64_t delta = (uint64_t)pass + 1;
+		for (size_t index = 0; index < count; index++) {
+			uint64_t* field = static_cast<uint64_t*>(slots[index]);
+			*field += delta;
+			sink ^= *field;
+		}
+	}
+	benchSink ^= sink;
+	return benchNow() - start;
+}
+
+static double benchUseGoldenWalk(void** slots, size_t count, uint32_t passes) {
+	/* golden-ratio hop adjusted to be coprime with count: every slot visited exactly
+	 * once per pass; no prefetcher can chase this order */
+	uint64_t step = 0x9E3779B97F4A7C15ULL % count;
+	while (useGcd((uint64_t)count, step) != 1) step++;
+	uint64_t sink = 0;
+	size_t index = 0;
+	double start = benchNow();
+	for (uint32_t pass = 0; pass < passes; pass++) {
+		for (size_t visit = 0; visit < count; visit++) {
+			sink += *static_cast<uint64_t*>(slots[index]);
+			index += step;
+			if (index >= count) index -= count;
+		}
+	}
+	benchSink ^= sink;
+	return benchNow() - start;
+}
+
+typedef double (*UsePatternFn)(void** slots, size_t count, uint32_t passes);
+
+/* one cell = alloc (untimed) -> timed traversal passes -> free (untimed), per allocator */
+static void runUsePhaseCell(BenchTarget* targets, std::vector<void*>& slots, double* seconds,
+	UsePatternFn pattern, const char* name, size_t size, size_t count, uint32_t passes) {
+	const uint64_t operations = (uint64_t)count * passes;
+
+	for (int t = 0; t < 3; t++) {
+		BenchTarget* target = &targets[t];
+		for (size_t index = 0; index < count; index++) {
+			slots[index] = target->allocate(target->context, size);
+			/* untimed init touch, like any real program initializing its objects: makes
+			 * pages resident and clears the MEM_RESET state trim leaves behind, so the
+			 * timed region measures steady-state use instead of kernel page recovery */
+			*static_cast<uint8_t*>(slots[index]) = (uint8_t)index;
+		}
+		seconds[t] = pattern(slots.data(), count, passes);
+		for (size_t index = 0; index < count; index++) {
+			target->deallocate(target->context, slots[index], size);
+		}
+	}
+	benchReport3(name, operations, seconds);
+}
+
+static void runUsePhaseBench(BenchTarget* targets) {
+	static const size_t sizes[] = { 16, 64, 256 };
+	static const size_t tierBytes[] = { (size_t)1 << 20, (size_t)32 << 20, (size_t)512 << 20 };
+	static const uint32_t tierPasses[] = { 1024, 32, 1 };
+	static const char* tierNames[] = { "1MB", "32MB", "512MB" };
+	char name[64];
+	double seconds[3];
+
+	printf("  -- use-phase layout impact (timed traversal only, alloc/free excluded) --\n");
+
+	static std::vector<void*> slots;
+	slots.reserve(tierBytes[2] / sizes[0]);
+
+	for (size_t sizeIndex = 0; sizeIndex < sizeof(sizes) / sizeof(sizes[0]); sizeIndex++) {
+		const size_t size = sizes[sizeIndex];
+		for (size_t tier = 0; tier < sizeof(tierBytes) / sizeof(tierBytes[0]); tier++) {
+			const size_t count = tierBytes[tier] / size;
+			const uint32_t passes = tierPasses[tier];
+			slots.resize(count);
+
+			snprintf(name, sizeof(name), "use read %zuB %s", size, tierNames[tier]);
+			runUsePhaseCell(targets, slots, seconds, benchUseLinearRead, name, size, count, passes);
+			snprintf(name, sizeof(name), "use rw %zuB %s", size, tierNames[tier]);
+			runUsePhaseCell(targets, slots, seconds, benchUseLinearRw, name, size, count, passes);
+			snprintf(name, sizeof(name), "use walk %zuB %s", size, tierNames[tier]);
+			runUsePhaseCell(targets, slots, seconds, benchUseGoldenWalk, name, size, count, passes);
+
+			/* deliberately no arenaSlab_trim here: malloc and FixedAllocator return freed
+			 * memory lazily too, and trim is a manual safe-point operation by design —
+			 * calling it every cell would hand arenaSlab a syscall-driven page-return
+			 * cost (and a MEM_RESET hangover) the others never pay. Freed arenas stay
+			 * cached in the partial chains, which is the matching deferred-return behavior. */
+		}
+	}
+}
+
 /* ---- unified comparison: three allocators under identical load patterns ---- */
 static void runBenchComparison(ArenaSlabAllocator* allocator) {
 	/* arenaSlab serves 16/32/64/128/256 only, so those class sizes are the common ground */
@@ -752,6 +868,8 @@ static void runBenchComparison(ArenaSlabAllocator* allocator) {
 		for (int t = 0; t < 3; t++) seconds[t] = benchPatternMixed(&targets[t], size, BENCH_PATTERN_OPS);
 		benchReport3(name, BENCH_PATTERN_OPS, seconds);
 	}
+
+	runUsePhaseBench(targets);
 }
 
 /* ---- runner: the full benchmark phase ---- */
