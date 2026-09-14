@@ -775,18 +775,50 @@ static double benchUseGoldenWalk(void** slots, size_t count, uint32_t passes) {
 
 typedef double (*UsePatternFn)(void** slots, size_t count, uint32_t passes);
 
+/* ---- use-phase cache control ----
+ * Eviction sweep between allocators: whichever allocator ran before leaves its footprint
+ * resident in L3, so later-tested allocators would start from a dirtier cache. The sweep
+ * gives every allocator the same cold-L3 start. The buffer must NOT come from malloc:
+ * heap-resident sweep pages would cycle the very physical pages the pointer array and
+ * FixedAllocator's blocks live on. It gets a dedicated kernel-VM region instead. */
+enum { SWEEP_BYTES = (size_t)512 << 20 }; /* >= 4x the largest current L3 (3D V-Cache) */
+
+static uint8_t* sweepBase = NULL;
+static bool sweepFailed = false;
+static unsigned sweepPass = 0;
+
+static void evictCaches(void) {
+	if (sweepBase == NULL) {
+		if (sweepFailed) return;
+		uint8_t* base = NULL;
+		uint8_t* reserveBase = NULL;
+		size_t reserveSize = 0;
+		if (osSegmentReserve(SWEEP_BYTES, &base, &reserveBase, &reserveSize) &&
+			osPagesCommit(base, SWEEP_BYTES)) {
+			sweepBase = base; /* intentionally never released: everything vanishes at process exit */
+		}
+		else {
+			sweepFailed = true;
+			printf("  (cache sweep unavailable, benchmark continues unswept)\n");
+			return;
+		}
+	}
+	memset(sweepBase, (int)(++sweepPass & 0xFF), SWEEP_BYTES);
+}
+
 /* one cell = alloc (untimed) -> timed traversal passes -> free (untimed), per allocator */
 static void runUsePhaseCell(BenchTarget* targets, std::vector<void*>& slots, double* seconds,
 	UsePatternFn pattern, const char* name, size_t size, size_t count, uint32_t passes) {
 	const uint64_t operations = (uint64_t)count * passes;
 
-	for (int t = 0; t < 3; t++) {
+	evictCaches(); /* same cold-L3 start for every allocator */
+
+	for (int t = 0; t < 3; t++) {		
 		BenchTarget* target = &targets[t];
 		for (size_t index = 0; index < count; index++) {
 			slots[index] = target->allocate(target->context, size);
 			/* untimed init touch, like any real program initializing its objects: makes
-			 * pages resident and clears the MEM_RESET state trim leaves behind, so the
-			 * timed region measures steady-state use instead of kernel page recovery */
+			 * pages resident so the timed region measures steady-state use */
 			*static_cast<uint8_t*>(slots[index]) = (uint8_t)index;
 		}
 		seconds[t] = pattern(slots.data(), count, passes);
