@@ -20,8 +20,9 @@
 *   until free/trim reclaim space. Pages of empty arenas can be returned via arenaSlab_trim
 *   (the header page is always kept).
 *
-* Bitmap convention: bit=1 free, bit=0 used; allocation scans with ctz, lowest index first.
-* Threading: single-threaded, lock-free; the free path is O(1) deterministic.
+ * Bitmap convention: bit=1 free, bit=0 used; allocation scans with ctz starting at the
+ * recent-free hint word and wraps around.
+ * Threading: single-threaded, lock-free; the free path is O(1) deterministic.
 */
 #pragma once
 
@@ -49,6 +50,8 @@ extern "C" {
 	/* ---- Arena header (24B, at the start of every arena)----
 	 * The bitmap follows right after; the header region (head + bitmap) is rounded up to whole slots;
 	 * slots [0, headerSlots) are permanently 0 (used) in the bitmap.
+	 * The tail of the header region holds a u32 recent-free slot hint (the claim scan start);
+	 * it sits in the rounding slack every class has (>= 8B) and inside the kept header page.
 	 * headerSlots is a pure function of classSize:
 	 *   headerSlots = ceil((24 + bitMapCount*8) / classSize)
 	 */

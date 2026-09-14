@@ -643,6 +643,39 @@ static void benchTrimCycle(void) {
 	arenaSlab_shutdown(&allocator);
 }
 
+/* adversarial pattern: frees cluster at the top of one arena and are re-claimed right away;
+ * probes the recent-free hint (a scan from word 0 would walk nearly the whole bitmap) */
+static void benchRecentFree(void) {
+	/* dedicated instance: isolates one 16B arena and its hint */
+	ArenaSlabAllocator allocator;
+	memset(&allocator, 0, sizeof(allocator));
+	if (!arenaSlab_init(&allocator, SEGMENT_SIZE_EXPONENT_DEFAULT)) {
+		printf("  recent-free bench skipped (init failed)\n");
+		return;
+	}
+	enum { ARENA_FILL = 1014, HOT = 100, CYCLES = 200000 };
+	static void* slots[ARENA_FILL];
+
+	for (uint32_t index = 0; index < ARENA_FILL; index++) slots[index] = arenaSlab_alloc(&allocator, 16);
+
+	uintptr_t sink = 0;
+	double start = benchNow();
+	for (uint32_t cycle = 0; cycle < CYCLES; cycle++) {
+		for (uint32_t index = ARENA_FILL - HOT; index < ARENA_FILL; index++) {
+			arenaSlab_free(&allocator, slots[index]);
+		}
+		for (uint32_t index = ARENA_FILL - HOT; index < ARENA_FILL; index++) {
+			slots[index] = arenaSlab_alloc(&allocator, 16);
+			sink ^= (uintptr_t)slots[index];
+		}
+	}
+	uint64_t operations = (uint64_t)CYCLES * 2 * HOT;
+	benchReport("recent-free reuse (top-100 of one arena)", operations, benchNow() - start);
+
+	arenaSlab_shutdown(&allocator);
+	benchSink ^= sink;
+}
+
 /* ---- unified comparison: three allocators under identical load patterns ---- */
 static void runBenchComparison(ArenaSlabAllocator* allocator) {
 	/* arenaSlab serves 16/32/64/128/256 only, so those class sizes are the common ground */
@@ -694,6 +727,7 @@ static void runBenches(void) {
 	printf("  -- arenaSlab-specific patterns --\n");
 	benchCarve();
 	benchTrimCycle();
+	benchRecentFree();
 	printf("  anti-optimization checksum: %llx\n", (unsigned long long)benchSink);
 
 	/* stats dump: arena_slab.h always defines LOG_MALLOC_STATS, so the stats API is always present */

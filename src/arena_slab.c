@@ -12,6 +12,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <assert.h>
 
  /* ---- Portable static assertions (works on MSVC / GCC / Clang)---- */
 #define slabConcat2(a, b) a##b
@@ -25,7 +26,8 @@
 typedef struct {
 	ArenaHead head;              // 24B
 	uint64_t  bitMap[1];         //  8B -> 32B
-	uint8_t   alignment[224];    // -> 256B (1 header slot)
+	uint32_t  recentFreeSlot;    // hint: most recently freed slot (claim scan start)
+	uint8_t   alignment[220];    // -> 256B (1 header slot)
 	uint8_t   payload[256 * (64 - 1)]; // 63 slots
 } Arena16K_256B;
 
@@ -33,7 +35,8 @@ typedef struct {
 typedef struct {
 	ArenaHead head;              // 24B
 	uint64_t  bitMap[2];         // 16B -> 40B
-	uint8_t   alignment[88];     // -> 128B (1 header slot)
+	uint32_t  recentFreeSlot;    // hint: most recently freed slot (claim scan start)
+	uint8_t   alignment[84];     // -> 128B (1 header slot)
 	uint8_t   payload[128 * (128 - 1)]; // 127 slots
 } Arena16K_128B;
 
@@ -41,7 +44,8 @@ typedef struct {
 typedef struct {
 	ArenaHead head;              // 24B
 	uint64_t  bitMap[4];         // 32B -> 56B
-	uint8_t   alignment[8];      // -> 64B (1 header slot)
+	uint32_t  recentFreeSlot;    // hint: most recently freed slot (claim scan start)
+	uint8_t   alignment[4];      // -> 64B (1 header slot)
 	uint8_t   payload[64 * (256 - 1)]; // 255 slots
 } Arena16K_64B;
 
@@ -49,7 +53,8 @@ typedef struct {
 typedef struct {
 	ArenaHead head;              // 24B
 	uint64_t  bitMap[8];         // 64B -> 88B
-	uint8_t   alignment[8];      // -> 96B (3 header slots)
+	uint32_t  recentFreeSlot;    // hint: most recently freed slot (claim scan start)
+	uint8_t   alignment[4];      // -> 96B (3 header slots)
 	uint8_t   payload[32 * (512 - 3)]; // 509 slots
 } Arena16K_32B;
 
@@ -57,7 +62,8 @@ typedef struct {
 typedef struct {
 	ArenaHead head;              // 24B
 	uint64_t  bitMap[16];        // 128B -> 152B
-	uint8_t   alignment[8];      // -> 160B (10 header slots)
+	uint32_t  recentFreeSlot;    // hint: most recently freed slot (claim scan start)
+	uint8_t   alignment[4];      // -> 160B (10 header slots)
 	uint8_t   payload[16 * (1024 - 10)]; // 1014 slots
 } Arena16K_16B;
 
@@ -95,6 +101,12 @@ static uint64_t* arenaBitmap(ArenaHead* arena) {
 	return (uint64_t*)((uint8_t*)arena + sizeof(ArenaHead));
 }
 
+/* Recent-free hint: lives in the header region's tail — the rounding slack every class
+ * has (>= 8B), inside the always-kept header page, so it survives trim drops. */
+static uint32_t* arenaRecentFreeSlot(ArenaHead* arena) {
+	return (uint32_t*)((uint8_t*)arena + sizeof(ArenaHead) + (size_t)arena->bitMapCount * sizeof(uint64_t));
+}
+
 static uint32_t arenaCapacity(const ArenaHead* arena) {
 	return (uint32_t)arena->bitMapCount * 64 - arena->headerSlots;
 }
@@ -104,17 +116,30 @@ static uint32_t arenaKeptBytes(uint32_t pageSize) {
 }
 
 /* ---- Bitmap operations ----
- * Convention: bit=1 free, bit=0 used; allocation scans with ctz, lowest index first
+ * Convention: bit=1 free, bit=0 used; allocation scans with ctz starting at the
+ * recent-free hint word and wraps around the bitmap.
  */
 
- /* Claim any free bit, return its slot index; -1 if none */
-static int64_t bitmapClaimSlot(uint64_t* bitmap, uint32_t wordCount) {
-	for (uint32_t wordIndex = 0; wordIndex < wordCount; wordIndex++) {
-		uint64_t word = bitmap[wordIndex];
-		if (word == 0) continue;
-		uint32_t bitIndex = (uint32_t)bits_ctz64(word);
-		bitmap[wordIndex] = word & ~(((uint64_t)1) << bitIndex);
-		return (int64_t)(wordIndex * 64 + bitIndex);
+ /* Claim the lowest free bit of one word; -1 if the word is full */
+static int64_t bitmapClaimInWord(uint64_t* bitmap, uint32_t wordIndex) {
+	uint64_t word = bitmap[wordIndex];
+	if (word == 0) return -1;
+	uint32_t bitIndex = (uint32_t)bits_ctz64(word);
+	bitmap[wordIndex] = word & ~(((uint64_t)1) << bitIndex);
+	return (int64_t)(wordIndex * 64 + bitIndex);
+}
+
+ /* Claim any free bit, return its slot index; -1 if none.
+  * Scans from startWord (the recent-free hint) and wraps around. */
+static int64_t bitmapClaimSlot(uint64_t* bitmap, uint32_t wordCount, uint32_t startWord) {
+	assert(startWord < wordCount); /* internal invariant: the hint is always a valid slot index */
+	for (uint32_t wordIndex = startWord; wordIndex < wordCount; wordIndex++) {
+		int64_t slotIndex = bitmapClaimInWord(bitmap, wordIndex);
+		if (slotIndex >= 0) return slotIndex;
+	}
+	for (uint32_t wordIndex = 0; wordIndex < startWord; wordIndex++) {
+		int64_t slotIndex = bitmapClaimInWord(bitmap, wordIndex);
+		if (slotIndex >= 0) return slotIndex;
 	}
 	return -1;
 }
@@ -166,6 +191,8 @@ static void arenaInit(ArenaHead* arena, uint32_t arenaBytes, uint16_t classSize,
 	for (uint32_t wordIndex = 1; wordIndex < bitmapWords; wordIndex++) {
 		bitmap[wordIndex] = ~(uint64_t)0;
 	}
+
+	*arenaRecentFreeSlot(arena) = 0; /* no free yet: start scanning from slot 0 */
 }
 
 /* ---- Segment operations ---- */
@@ -228,7 +255,8 @@ static uint32_t slotClassIndexOf(size_t size) {
 
 static void* arenaSlotClaim(ArenaHead* arena, uint32_t shift) {
 	uint64_t* bitmap = arenaBitmap(arena);
-	int64_t slotIndex = bitmapClaimSlot(bitmap, arena->bitMapCount);
+	uint32_t startWord = *arenaRecentFreeSlot(arena) >> 6;
+	int64_t slotIndex = bitmapClaimSlot(bitmap, arena->bitMapCount, startWord);
 	if (slotIndex < 0) return NULL;
 	arena->freeSlotCount--;
 	return (uint8_t*)arena + ((size_t)slotIndex << shift);
@@ -321,6 +349,7 @@ static bool smallLayerFree(ArenaSlabAllocator* context, Segment* segment, ArenaH
 	bool wasFull = arena->freeSlotCount == 0;
 	bitmap[slotIndex >> 6] |= mask;
 	arena->freeSlotCount++;
+	*arenaRecentFreeSlot(arena) = slotIndex; /* recent-free hint: next claim starts here */
 	if (wasFull) {
 		if (arena->next == (uint64_t)SLAB_OFFSET_UNLINKED) {
 			segmentPushArena(segment, classIndex, arena);
