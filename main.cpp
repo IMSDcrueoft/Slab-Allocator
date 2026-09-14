@@ -166,7 +166,7 @@ static void testInitValidation(void) {
 	CHECK(arenaSlab_which(NULL, NULL) == SLAB_LAYER_NONE);
 	CHECK(arenaSlab_usable_size(NULL, NULL) == 0);
 	CHECK(arenaSlab_segmentBase(NULL) == 0);
-	CHECK(arenaSlab_trim(NULL) == 0);
+	CHECK(arenaSlab_trim(NULL, 0) == 0);
 	arenaSlab_shutdown(NULL); /* must not crash */
 	arenaSlab_statsReset(NULL);
 
@@ -179,7 +179,7 @@ static void testInitValidation(void) {
 	CHECK(arenaSlab_which(&garbage, &garbage) == SLAB_LAYER_NONE);
 	CHECK(arenaSlab_usable_size(&garbage, &garbage) == 0);
 	CHECK(arenaSlab_segmentBase(&garbage) == 0);
-	CHECK(arenaSlab_trim(&garbage) == 0);
+	CHECK(arenaSlab_trim(&garbage, 0) == 0);
 	CHECK(arenaSlab_free(&garbage, &garbage) == false);
 	arenaSlab_shutdown(&garbage); /* must be a no-op, never a release of garbage pointers */
 	arenaSlab_statsReset(&garbage);
@@ -313,7 +313,7 @@ static void testTrimAndReuse(ArenaSlabAllocator* allocator) {
 	size_t dropLength = (pageSize < ARENA_SIZE_SMALL) ? (size_t)(ARENA_SIZE_SMALL - pageSize) : 0;
 
 	/* baseline: empty arenas left over from the earlier tests must not skew the count below */
-	(void)arenaSlab_trim(allocator);
+	(void)arenaSlab_trim(allocator, TRIM_KEEP_EMPTY_DEFAULT);
 
 	for (uint32_t index = 0; index < count; index++) {
 		slots[index] = arenaSlab_alloc(allocator, 16);
@@ -323,11 +323,11 @@ static void testTrimAndReuse(ArenaSlabAllocator* allocator) {
 		CHECK(arenaSlab_free(allocator, slots[index]) == true);
 	}
 
-	size_t dropped = arenaSlab_trim(allocator);
+	size_t dropped = arenaSlab_trim(allocator, TRIM_KEEP_EMPTY_DEFAULT);
 	printf("  trim dropped %llu bytes\n", (unsigned long long)dropped);
-	CHECK(dropped == (size_t)ARENAS * dropLength); /* exactly our 5 arenas, nothing else */
+	CHECK(dropped == (size_t)(ARENAS - TRIM_KEEP_EMPTY_DEFAULT) * dropLength); /* 5 empties: 2 head-most kept warm, the rest dropped */
 
-	/* the dropped arenas must return through the reuse path, fully writable */
+	/* the dropped arenas must return through the shared free-chain, fully writable */
 	for (uint32_t index = 0; index < count; index++) {
 		slots[index] = arenaSlab_alloc(allocator, 16);
 		CHECK(slots[index] != NULL);
@@ -338,6 +338,66 @@ static void testTrimAndReuse(ArenaSlabAllocator* allocator) {
 	for (uint32_t index = 0; index < count; index++) {
 		CHECK(arenaSlab_free(allocator, slots[index]) == true);
 	}
+
+	/* knob edges: keep=huge drops nothing, keep=0 sweeps every class's empties — our five
+	 * 16B arenas plus the warm reserves the earlier tests left in the other classes */
+	CHECK(arenaSlab_trim(allocator, UINT32_MAX) == 0);
+	size_t droppedAll = arenaSlab_trim(allocator, 0);
+	printf("  trim(0) dropped %llu bytes\n", (unsigned long long)droppedAll);
+	CHECK(droppedAll >= (size_t)ARENAS * dropLength);
+}
+
+/* ---- cross-size reuse: shells trimmed from one class must serve another ---- */
+static void testCrossSizeReuse(void) {
+	section("cross-size shell reuse (256B shells -> 16B class)");
+	/* dedicated instance so the free-chain state is fully controlled */
+	ArenaSlabAllocator allocator;
+	memset(&allocator, 0, sizeof(allocator));
+	CHECK(arenaSlab_init(&allocator, SEGMENT_SIZE_EXPONENT_DEFAULT) == true);
+
+	uint32_t pageSize = osPageSize();
+	size_t dropLength = (pageSize < ARENA_SIZE_SMALL) ? (size_t)(ARENA_SIZE_SMALL - pageSize) : 0;
+	(void)dropLength; /* asserted through the trim counts below on sub-16KB-page systems */
+
+	/* 256B phase: fill four arenas (4 x 63 slots), free everything, trim -> two head-most
+	 * stay warm, two shells move to the shared free-chain */
+	enum { COUNT_256B = 4 * 63 };
+	static void* big[COUNT_256B];
+	uintptr_t rangeMin = ~(uintptr_t)0;
+	uintptr_t rangeMax = 0;
+	for (uint32_t index = 0; index < COUNT_256B; index++) {
+		big[index] = arenaSlab_alloc(&allocator, 256);
+		CHECK(big[index] != NULL);
+		if (big[index] != NULL) {
+			uintptr_t block = (uintptr_t)big[index] & ~(uintptr_t)(ARENA_SIZE_SMALL - 1);
+			if (block < rangeMin) rangeMin = block;
+			if (block > rangeMax) rangeMax = block;
+		}
+	}
+	for (uint32_t index = 0; index < COUNT_256B; index++) {
+		CHECK(arenaSlab_free(&allocator, big[index]) == true);
+	}
+	CHECK(arenaSlab_trim(&allocator, TRIM_KEEP_EMPTY_DEFAULT) == 2 * dropLength); /* 4 empties - 2 warm */
+
+	/* 16B phase: the 16B class chain is empty, so the shells must be revived cross-size —
+	 * every new slot must land inside the old 256B arena blocks (a fresh carve would sit
+	 * beyond the old frontier and fail this check) */
+	enum { COUNT_16B = 2 * 1014 };
+	static void* small[COUNT_16B];
+	for (uint32_t index = 0; index < COUNT_16B; index++) {
+		small[index] = arenaSlab_alloc(&allocator, 16);
+		CHECK(small[index] != NULL);
+		if (small[index] != NULL) {
+			uintptr_t block = (uintptr_t)small[index] & ~(uintptr_t)(ARENA_SIZE_SMALL - 1);
+			CHECK(block >= rangeMin && block <= rangeMax);
+			memset(small[index], 0xCD, 16); /* revived payload pages must be writable */
+		}
+	}
+	for (uint32_t index = 0; index < COUNT_16B; index++) {
+		CHECK(arenaSlab_free(&allocator, small[index]) == true);
+	}
+
+	arenaSlab_shutdown(&allocator);
 }
 
 /* ---- trim regression: a dropped arena at a chain head must not block later classes ---- */
@@ -550,7 +610,7 @@ static void runArenaSlabTests(void) {
 	testChainReuse(&allocator);
 	testChurn(&allocator);
 	testTrimAndReuse(&allocator);
-	testTrimDroppedHead();
+	testCrossSizeReuse();
 	testRealloc(&allocator);
 	testForeignPointers(&allocator, segmentExponent);
 	testInteriorPointerRejection(&allocator);
@@ -807,7 +867,7 @@ static void benchTrimCycle(void) {
 	for (uint32_t cycle = 0; cycle < BENCH_TRIM_CYCLES; cycle++) {
 		for (uint32_t index = 0; index < SLOTS; index++) slots[index] = arenaSlab_alloc(&allocator, 16);
 		for (uint32_t index = 0; index < SLOTS; index++) arenaSlab_free(&allocator, slots[index]);
-		(void)arenaSlab_trim(&allocator);
+		(void)arenaSlab_trim(&allocator, TRIM_KEEP_EMPTY_DEFAULT);
 	}
 	uint64_t operations = (uint64_t)BENCH_TRIM_CYCLES * (2 * (uint64_t)SLOTS + 1);
 	benchReport("trim cycle (alloc/free/trim x3)", operations, benchNow() - start);
@@ -1056,7 +1116,7 @@ static void runBenches(void) {
 	CHECK(arenaSlab_init(&allocator, SEGMENT_SIZE_EXPONENT_DEFAULT) == true);
 	void* statsPointer = arenaSlab_alloc(&allocator, 64);
 	arenaSlab_free(&allocator, statsPointer);
-	(void)arenaSlab_trim(&allocator);
+	(void)arenaSlab_trim(&allocator, TRIM_KEEP_EMPTY_DEFAULT);
 	arenaSlab_dumpStats(&allocator);
 	arenaSlab_statsReset(&allocator);
 	arenaSlab_shutdown(&allocator);

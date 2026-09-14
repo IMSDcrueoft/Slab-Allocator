@@ -51,6 +51,9 @@ extern "C" {
 		SLOT_SIZE_MIN = 1 << SLOT_CLASS_SHIFT_MIN, /* 16 */
 		SLOT_SIZE_MAX = 256,
 		SLOT_CLASS_COUNT = 5,          /* 16/32/64/128/256 */
+		TRIM_KEEP_EMPTY_DEFAULT = 2,   /* suggested per-class warm empty arenas for arenaSlab_trim:
+		                                * the chain-head-most empties stay resident so high-churn reuse
+		                                * revives them without soft faults; 0 drops every empty arena */
 		SEGMENT_SIZE_EXPONENT_MIN = 20,     /* smallest segment: 1<<20 = 1MB (keeps the base 16KB-aligned) */
 		SEGMENT_SIZE_EXPONENT_MAX = 40,     /* largest segment: 1<<40 = 1TB */
 		SEGMENT_SIZE_EXPONENT_DEFAULT = 32, /* arenaSlabDefault: 1<<32 = 4GB */
@@ -95,7 +98,10 @@ extern "C" {
 	 * stamped (zeroed, garbage or foreign memory), so no pre-zeroing is ever required.
 	 */
 	typedef struct Segment {
-		uint64_t partial[SLOT_CLASS_COUNT]; /* per-class chains: only allocatable arenas (partial, or empty + dropped) */
+		uint64_t partial[SLOT_CLASS_COUNT]; /* per-class chains: only allocatable arenas (partial, or empty + kept warm) */
+		uint64_t dropped;      /* segment-wide free-chain of trimmed empty arenas, shared by all sizes;
+		                        * alloc revives from here (re-initializing the shell for the wanted
+		                        * class) before carving fresh VA — no class-pinned stranded shells */
 		uint8_t* base;         /* segment base, aligned to the segment size */
 		uint8_t* frontier;     /* carve frontier (monotonically grows) */
 		uint8_t* committedEnd; /* end of the committed range */
@@ -183,10 +189,14 @@ extern "C" {
 	 * Returns 0 while the context is uninitialized. */
 	uintptr_t arenaSlab_segmentBase(ArenaSlabAllocator* context);
 
-	/* Lazy return: drop page contents of empty arenas (metadata is kept);
-	 * never changes allocator state; safe to call anytime; returns dropped bytes.
-	 * trim is NEVER called automatically by design; call it from safe points. */
-	size_t arenaSlab_trim(ArenaSlabAllocator* context);
+	/* Lazy return: drop page contents of empty arenas (metadata is kept); returns dropped bytes.
+	 * keepEmpty: per class, how many chain-head-most empty arenas to keep warm (pages resident)
+	 * so high-churn reuse revives them without soft faults; 0 drops every empty arena. Dropped
+	 * shells move to a segment-wide free-chain shared by all sizes: alloc revives from it
+	 * (re-initializing the shell for the wanted class) before carving fresh VA.
+	 * trim is NEVER called automatically by design; call it from safe points.
+	 * Suggested steady-state value: TRIM_KEEP_EMPTY_DEFAULT. */
+	size_t arenaSlab_trim(ArenaSlabAllocator* context, uint32_t keepEmpty);
 
 	/* ---- Statistics (enabled with -DLOG_MALLOC_STATS)---- */
 	void arenaSlab_statsReset(ArenaSlabAllocator* context);

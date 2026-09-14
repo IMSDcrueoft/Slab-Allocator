@@ -241,6 +241,20 @@ static void arenaPopHead(Segment* segment, uint32_t chainIndex, ArenaHead* arena
 	arena->next = (uint64_t)SLAB_OFFSET_UNLINKED;
 }
 
+/* Shared free-chain of trimmed empty arenas, reusable by every slot class */
+static void segmentPushDropped(Segment* segment, ArenaHead* arena) {
+	arena->next = segment->dropped;
+	segment->dropped = (uint64_t)((uint8_t*)arena - segment->base);
+}
+
+static ArenaHead* segmentPopDropped(Segment* segment) {
+	if (segment->dropped == (uint64_t)SLAB_OFFSET_NONE) return NULL;
+	ArenaHead* arena = (ArenaHead*)(segment->base + segment->dropped);
+	segment->dropped = arena->next;
+	arena->next = (uint64_t)SLAB_OFFSET_UNLINKED;
+	return arena;
+}
+
 /* ---- Small layer ---- */
 
 static uint32_t slotClassIndexOf(size_t size) {
@@ -282,8 +296,8 @@ static void* smallLayerAlloc(ArenaSlabAllocator* context, uint32_t classIndex) {
 	return smallLayerAllocSlow(context, classIndex);
 }
 
-/* Slow path: the chain head is dropped (revive its pages) or the chain is empty (carve).
- * No walk: every chain member is allocatable by invariant, so the head always serves. */
+/* Slow path: the class chain holds only allocatable arenas, so the head always serves;
+ * an exhausted chain revives a shell from the shared free-chain (any size) or carves. */
 static void* smallLayerAllocSlow(ArenaSlabAllocator* context, uint32_t classIndex) {
 	uint16_t classSize = (uint16_t)(((uint32_t)1) << (classIndex + SLOT_CLASS_SHIFT_MIN)); /* classes are powers of two */
 	Segment* segment = &context->segment;
@@ -293,18 +307,7 @@ static void* smallLayerAllocSlow(ArenaSlabAllocator* context, uint32_t classInde
 		if (offset == (uint64_t)SLAB_OFFSET_NONE) break;
 		ArenaHead* arena = (ArenaHead*)(segment->base + offset);
 
-		if (arena->magic == magicArenaSmallDropped) {
-			if (arena->classSize != classSize) return NULL;
-			uint32_t pageSize = osPageSize(); /* one call: kept length and reuse base share it */
-			size_t reuseLength = ARENA_SIZE_SMALL - arenaKeptBytes(pageSize);
-			if (!osPagesReuse((uint8_t*)arena + arenaKeptBytes(pageSize), reuseLength)) return NULL;
-			arena->magic = magicArenaSmall;
-#ifdef LOG_MALLOC_STATS
-			slabLayerStats* stats = segmentStats(segment);
-			if (stats != NULL) { stats->reuseCalls++; stats->reuseBytes += reuseLength; }
-#endif
-		}
-		else if (arena->magic != magicArenaSmall || arena->classSize != classSize) {
+		if (arena->magic != magicArenaSmall || arena->classSize != classSize) {
 			return NULL;
 		}
 
@@ -322,8 +325,26 @@ static void* smallLayerAllocSlow(ArenaSlabAllocator* context, uint32_t classInde
 		return slot;
 	}
 
-	ArenaHead* arena = segmentCarveArena(segment, ARENA_SIZE_SMALL, classIndex + SLOT_CLASS_SHIFT_MIN, magicArenaSmall);
-	if (arena == NULL) return NULL;
+	/* class chain empty: revive a trimmed shell from the shared free-chain (any class),
+	 * re-initializing it for the wanted size; fall back to carving fresh VA */
+	ArenaHead* arena = segmentPopDropped(segment);
+	if (arena != NULL) {
+		uint32_t pageSize = osPageSize(); /* one call: kept length and reuse base share it */
+		size_t reuseLength = ARENA_SIZE_SMALL - arenaKeptBytes(pageSize);
+		if (!osPagesReuse((uint8_t*)arena + arenaKeptBytes(pageSize), reuseLength)) {
+			segmentPushDropped(segment, arena); /* put the shell back; state preserved */
+			return NULL;
+		}
+#ifdef LOG_MALLOC_STATS
+		slabLayerStats* stats = segmentStats(segment);
+		if (stats != NULL) { stats->reuseCalls++; stats->reuseBytes += reuseLength; }
+#endif
+		arenaInit(arena, ARENA_SIZE_SMALL, classIndex + SLOT_CLASS_SHIFT_MIN, magicArenaSmall);
+	}
+	else {
+		arena = segmentCarveArena(segment, ARENA_SIZE_SMALL, classIndex + SLOT_CLASS_SHIFT_MIN, magicArenaSmall);
+		if (arena == NULL) return NULL;
+	}
 	segmentPushArena(segment, classIndex, arena);
 	return arenaSlotClaim(arena, classIndex + SLOT_CLASS_SHIFT_MIN);
 }
@@ -372,11 +393,12 @@ bool arenaSlab_init(ArenaSlabAllocator* context, uint8_t segmentSizeExponent) {
 	/* garbage / foreign memory is never trusted: rebuild the whole context from scratch */
 	memset(context, 0, sizeof(*context));
 	/* zero is a VALID chain offset (the first arena sits at segment base + 0), so the
-	 * empty-chain sentinel must be written explicitly — memset alone would alias it
-	 * with "arena at offset 0" and the alloc fast path would deref uncommitted memory */
+	 * empty-chain sentinels must be written explicitly — memset alone would alias them
+	 * with "arena at offset 0" and the alloc paths would deref uncommitted memory */
 	for (uint32_t chainIndex = 0; chainIndex < SLOT_CLASS_COUNT; chainIndex++) {
 		context->segment.partial[chainIndex] = (uint64_t)SLAB_OFFSET_NONE;
 	}
+	context->segment.dropped = (uint64_t)SLAB_OFFSET_NONE;
 	if (segmentSizeExponent < SEGMENT_SIZE_EXPONENT_MIN || segmentSizeExponent > SEGMENT_SIZE_EXPONENT_MAX) return false;
 
 	uint64_t segmentBytes = ((uint64_t)1 << segmentSizeExponent);
@@ -492,39 +514,64 @@ uintptr_t arenaSlab_segmentBase(ArenaSlabAllocator* context) {
 }
 
 /* ---- Lazy return (small only) ---- */
-static size_t trimSmallLayer(ArenaSlabAllocator* context) {
+static size_t trimSmallLayer(ArenaSlabAllocator* context, uint32_t keepEmpty) {
 	uint32_t pageSize = osPageSize();
 	size_t droppedBytes = 0;
 	Segment* segment = &context->segment;
 	for (uint32_t classIndex = 0; classIndex < SLOT_CLASS_COUNT; classIndex++) {
-		uint64_t arenaOffset = segment->partial[classIndex];
+		/* rebuild walk: kept arenas are relinked in place (original order), trimmed empties
+		 * move to the segment-wide free-chain; on a corrupt node the unscanned remainder is
+		 * spliced back onto the rebuilt tail so no arena is ever lost */
+		uint64_t originalHead = segment->partial[classIndex];
+		uint64_t newHead = (uint64_t)SLAB_OFFSET_NONE;
+		ArenaHead* newTail = NULL;
+		uint32_t keptEmpty = keepEmpty;
+		uint64_t arenaOffset = originalHead;
 		while (arenaOffset != (uint64_t)SLAB_OFFSET_NONE) {
 			ArenaHead* arena = (ArenaHead*)(segment->base + arenaOffset);
-			if (arena->magic == magicArenaSmallDropped) {
-				arenaOffset = arena->next; /* already dropped: skip, later arenas still count */
-				continue;
+			if (arena->magic != magicArenaSmall && arena->magic != magicArenaSmallDropped) {
+				if (newTail != NULL) newTail->next = arenaOffset; /* splice the unscanned remainder */
+				break;
 			}
-			if (arena->magic != magicArenaSmall) return droppedBytes;
-			if (arena->freeSlotCount == arenaCapacity(arena) && pageSize < ARENA_SIZE_SMALL) {
-				size_t dropLength = ARENA_SIZE_SMALL - pageSize;
-				if (osPagesDrop((uint8_t*)arena + pageSize, dropLength)) {
-					droppedBytes += dropLength;
-					arena->magic = magicArenaSmallDropped;
+			uint64_t nextOffset = arena->next;
+			bool keep = true;
+			if (arena->magic == magicArenaSmallDropped) {
+				segmentPushDropped(segment, arena); /* already dropped: move to the shared chain */
+				keep = false;
+			}
+			else if (arena->freeSlotCount == arenaCapacity(arena) && pageSize < ARENA_SIZE_SMALL) {
+				if (keptEmpty > 0) {
+					keptEmpty--; /* warm spare: stays resident for cheap revival */
+				}
+				else {
+					size_t dropLength = ARENA_SIZE_SMALL - pageSize;
+					if (osPagesDrop((uint8_t*)arena + pageSize, dropLength)) {
+						droppedBytes += dropLength;
+						segmentPushDropped(segment, arena);
+						keep = false;
 #ifdef LOG_MALLOC_STATS
-					slabLayerStats* stats = segmentStats(segment);
-					if (stats != NULL) { stats->dropCalls++; stats->dropBytes += dropLength; }
+						slabLayerStats* stats = segmentStats(segment);
+						if (stats != NULL) { stats->dropCalls++; stats->dropBytes += dropLength; }
 #endif
+					}
 				}
 			}
-			arenaOffset = arena->next;
+			if (keep) {
+				if (newTail == NULL) newHead = arenaOffset;
+				else newTail->next = arenaOffset;
+				newTail = arena;
+			}
+			arenaOffset = nextOffset;
 		}
+		if (newTail != NULL) newTail->next = (uint64_t)SLAB_OFFSET_NONE;
+		segment->partial[classIndex] = (newHead != (uint64_t)SLAB_OFFSET_NONE) ? newHead : originalHead;
 	}
 	return droppedBytes;
 }
 
-size_t arenaSlab_trim(ArenaSlabAllocator* context) {
+size_t arenaSlab_trim(ArenaSlabAllocator* context, uint32_t keepEmpty) {
 	if (context == NULL || context->cookie != arenaSlabCookie) return 0;
-	return trimSmallLayer(context);
+	return trimSmallLayer(context, keepEmpty);
 }
 
 /* ---- Statistics ---- */
@@ -569,27 +616,35 @@ void arenaSlab_dumpStats(ArenaSlabAllocator* context) {
 	printf("[small]\n");
 	dumpLayerEvents(&context->stats);
 	{
-		uint64_t arenaTotal = 0, emptyCount = 0, droppedCount = 0;
+		uint64_t chainArenas = 0, emptyCount = 0, droppedCount = 0;
 		uint64_t liveSlots = 0, capacitySlots = 0;
 		Segment* segment = &context->segment;
 		for (uint32_t classIndex = 0; classIndex < SLOT_CLASS_COUNT; classIndex++) {
 			uint64_t arenaOffset = segment->partial[classIndex];
 			while (arenaOffset != (uint64_t)SLAB_OFFSET_NONE) {
 				ArenaHead* arena = (ArenaHead*)(segment->base + arenaOffset);
-				arenaTotal++;
+				chainArenas++;
 				uint32_t capacity = arenaCapacity(arena);
 				capacitySlots += capacity;
 				liveSlots += capacity - arena->freeSlotCount;
 				if (arena->freeSlotCount == capacity) emptyCount++;
-				if (arena->magic == magicArenaSmallDropped) droppedCount++;
 				arenaOffset = arena->next;
 			}
 		}
-		/* full arenas are off-chain and thus not walked; dropped is a subset of empty */
-		printf("  State: arenas %llu (empty %llu [dropped %llu] / partial %llu), slots live %llu / %llu\n",
-			(unsigned long long)arenaTotal, (unsigned long long)emptyCount,
+		uint64_t poolOffset = segment->dropped;
+		while (poolOffset != (uint64_t)SLAB_OFFSET_NONE) {
+			ArenaHead* arena = (ArenaHead*)(segment->base + poolOffset);
+			droppedCount++;
+			uint32_t capacity = arenaCapacity(arena); /* stale but self-consistent old-class geometry */
+			capacitySlots += capacity;
+			poolOffset = arena->next;
+		}
+		/* full arenas are off-chain and thus not walked; kept empties are the warm reserve */
+		printf("  State: arenas %llu (chain %llu: empty %llu / partial %llu | dropped pool %llu), slots live %llu / %llu\n",
+			(unsigned long long)(chainArenas + droppedCount), (unsigned long long)chainArenas,
+			(unsigned long long)emptyCount,
+			(unsigned long long)(chainArenas - emptyCount),
 			(unsigned long long)droppedCount,
-			(unsigned long long)(arenaTotal - emptyCount),
 			(unsigned long long)liveSlots, (unsigned long long)capacitySlots);
 		dumpSegmentWatermarks(segment);
 	}
