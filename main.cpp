@@ -154,11 +154,11 @@ static void testInitValidation(void) {
 	CHECK(arenaSlab_init(NULL, SEGMENT_SIZE_EXPONENT_DEFAULT) == false);
 	CHECK(arenaSlab_init(&allocator, SEGMENT_SIZE_EXPONENT_MIN - 1) == false); /* 1MB - 1 page: rejected */
 	CHECK(arenaSlab_init(&allocator, SEGMENT_SIZE_EXPONENT_MAX + 1) == false); /* > 1TB: rejected */
-	CHECK(allocator.initialized == false); /* failed attempts must not half-initialize */
+	CHECK(allocator.cookie == 0); /* failed attempts must not half-initialize */
 
 	CHECK(arenaSlab_init(&allocator, SEGMENT_SIZE_EXPONENT_MIN) == true); /* 1MB */
 	arenaSlab_shutdown(&allocator);
-	CHECK(allocator.initialized == false);
+	CHECK(allocator.cookie == 0);
 
 	/* NULL context must be safe everywhere */
 	CHECK(arenaSlab_alloc(NULL, 16) == NULL);
@@ -169,6 +169,29 @@ static void testInitValidation(void) {
 	CHECK(arenaSlab_trim(NULL) == 0);
 	arenaSlab_shutdown(NULL); /* must not crash */
 	arenaSlab_statsReset(NULL);
+
+	/* garbage context (never zeroed, e.g. a forgotten stack init): every API must reject it
+	 * by the cookie gate without touching memory — the old code dereferenced garbage in
+	 * alloc and released garbage pointers in shutdown */
+	ArenaSlabAllocator garbage;
+	memset(&garbage, 0xAB, sizeof(garbage));
+	CHECK(arenaSlab_alloc(&garbage, 16) == NULL);
+	CHECK(arenaSlab_which(&garbage, &garbage) == SLAB_LAYER_NONE);
+	CHECK(arenaSlab_usable_size(&garbage, &garbage) == 0);
+	CHECK(arenaSlab_segmentBase(&garbage) == 0);
+	CHECK(arenaSlab_trim(&garbage) == 0);
+	CHECK(arenaSlab_free(&garbage, &garbage) == false);
+	arenaSlab_shutdown(&garbage); /* must be a no-op, never a release of garbage pointers */
+	arenaSlab_statsReset(&garbage);
+
+	/* init rebuilds a garbage context from scratch */
+	CHECK(arenaSlab_init(&garbage, SEGMENT_SIZE_EXPONENT_MIN) == true);
+	void* garbageSlot = arenaSlab_alloc(&garbage, 16);
+	CHECK(garbageSlot != NULL);
+	CHECK(arenaSlab_free(&garbage, garbageSlot) == true);
+	arenaSlab_shutdown(&garbage);
+	CHECK(arenaSlab_init(&garbage, SEGMENT_SIZE_EXPONENT_MIN) == true); /* re-init after shutdown */
+	arenaSlab_shutdown(&garbage);
 }
 
 /* ---- the documented default instance ---- */
@@ -317,6 +340,50 @@ static void testTrimAndReuse(ArenaSlabAllocator* allocator) {
 	}
 }
 
+/* ---- trim regression: a dropped arena at a chain head must not block later classes ---- */
+static void testTrimDroppedHead(void) {
+	section("trim: dropped chain head does not block later classes");
+	/* dedicated instance so the chain states are fully controlled */
+	ArenaSlabAllocator allocator;
+	memset(&allocator, 0, sizeof(allocator));
+	CHECK(arenaSlab_init(&allocator, SEGMENT_SIZE_EXPONENT_DEFAULT) == true);
+
+	/* per-arena dropped size: everything past the first page; 0 on 16KB-page systems */
+	uint32_t pageSize = osPageSize();
+	size_t dropLength = (pageSize < ARENA_SIZE_SMALL) ? (size_t)(ARENA_SIZE_SMALL - pageSize) : 0;
+
+	/* 16B: fill exactly two arenas, free everything, trim -> the 16B chain head is dropped */
+	enum { COUNT_16B = 2 * 1014 };
+	static void* slots[COUNT_16B];
+	for (uint32_t index = 0; index < COUNT_16B; index++) {
+		slots[index] = arenaSlab_alloc(&allocator, 16);
+		CHECK(slots[index] != NULL);
+	}
+	for (uint32_t index = 0; index < COUNT_16B; index++) {
+		CHECK(arenaSlab_free(&allocator, slots[index]) == true);
+	}
+	CHECK(arenaSlab_trim(&allocator) == 2 * dropLength);
+
+	/* 32B: one arena touched and emptied again -> newly droppable, but trim only reaches
+	 * it by walking past the dropped 16B chain head */
+	enum { COUNT_32B = 8 };
+	void* smallSlots[COUNT_32B];
+	for (uint32_t index = 0; index < COUNT_32B; index++) {
+		smallSlots[index] = arenaSlab_alloc(&allocator, 32);
+		CHECK(smallSlots[index] != NULL);
+	}
+	for (uint32_t index = 0; index < COUNT_32B; index++) {
+		CHECK(arenaSlab_free(&allocator, smallSlots[index]) == true);
+	}
+
+	/* old bug: trim bailed out at the dropped 16B head and never reached the 32B class */
+	CHECK(arenaSlab_trim(&allocator) == dropLength);
+	CHECK(arenaSlab_trim(&allocator) == 0); /* everything already dropped: skip-all walk */
+	CHECK(arenaSlab_trim(&allocator) == 0);
+
+	arenaSlab_shutdown(&allocator);
+}
+
 /* ---- realloc semantics ---- */
 static void testRealloc(ArenaSlabAllocator* allocator) {
 	section("realloc");
@@ -347,13 +414,73 @@ static void testRealloc(ArenaSlabAllocator* allocator) {
 }
 
 /* ---- foreign pointers must be rejected without touching the allocator ---- */
-static void testForeignPointers(ArenaSlabAllocator* allocator) {
+static void testForeignPointers(ArenaSlabAllocator* allocator, uint8_t segmentSizeExponent) {
 	section("foreign pointers");
 	int stackValue = 0;
 	CHECK(arenaSlab_which(allocator, &stackValue) == SLAB_LAYER_NONE);
 	CHECK(arenaSlab_usable_size(allocator, &stackValue) == 0);
 	CHECK(arenaSlab_free(allocator, &stackValue) == false);
 	CHECK(arenaSlab_free(allocator, NULL) == true);
+
+	/* bogus addresses just below the segment and at the reservation tail: unmapped /
+	 * PAGE_NOACCESS, must be rejected by pure arithmetic — never dereferenced (the old
+	 * code read the arena header first and crashed). The tail derives from the actual
+	 * segment size, so this holds for every exponent, not just the 4GB default. */
+	uintptr_t base = arenaSlab_segmentBase(allocator);
+	void* belowBase = (void*)(base - 16);
+	void* reservationTail = (void*)(base + ((uintptr_t)1 << segmentSizeExponent) - 16);
+	CHECK(arenaSlab_which(allocator, belowBase) == SLAB_LAYER_NONE);
+	CHECK(arenaSlab_usable_size(allocator, belowBase) == 0);
+	CHECK(arenaSlab_free(allocator, belowBase) == false);
+	CHECK(arenaSlab_which(allocator, reservationTail) == SLAB_LAYER_NONE);
+	CHECK(arenaSlab_usable_size(allocator, reservationTail) == 0);
+	CHECK(arenaSlab_free(allocator, reservationTail) == false);
+	CHECK(arenaSlab_realloc(allocator, &stackValue, 32) == NULL); /* foreign: rejected, left untouched */
+}
+
+/* ---- in-arena but invalid pointers (header region, misaligned, tail) must be rejected ---- */
+static void testInteriorPointerRejection(ArenaSlabAllocator* allocator) {
+	section("interior pointer rejection");
+	void* slot = arenaSlab_alloc(allocator, 16);
+	CHECK(slot != NULL);
+	if (slot == NULL) return;
+	uintptr_t arenaBase = (uintptr_t)slot & ~(uintptr_t)(ARENA_SIZE_SMALL - 1);
+
+	/* all of these live inside a carved arena (which reports SMALL) but are not freeable
+	 * slots: the arena base, header bytes, a header slot, a mid-slot and the arena tail */
+	CHECK(arenaSlab_which(allocator, (void*)(arenaBase + 8)) == SLAB_LAYER_SMALL);
+	CHECK(arenaSlab_free(allocator, (void*)arenaBase) == false);                          /* header slot 0 */
+	CHECK(arenaSlab_free(allocator, (void*)(arenaBase + 8)) == false);                    /* header bytes, misaligned */
+	CHECK(arenaSlab_free(allocator, (void*)(arenaBase + 16)) == false);                   /* header slot 1 */
+	CHECK(arenaSlab_free(allocator, (void*)((uintptr_t)slot + 8)) == false);              /* mid-slot, misaligned */
+	CHECK(arenaSlab_free(allocator, (void*)(arenaBase + ARENA_SIZE_SMALL - 1)) == false); /* arena tail byte */
+
+	CHECK(arenaSlab_free(allocator, slot) == true); /* the real slot still frees */
+}
+
+/* ---- two-instance isolation: one allocator must never accept the other's pointers ---- */
+static void testCrossInstanceIsolation(void) {
+	section("two-instance isolation");
+	ArenaSlabAllocator a;
+	ArenaSlabAllocator b;
+	memset(&a, 0, sizeof(a));
+	memset(&b, 0, sizeof(b));
+	CHECK(arenaSlab_init(&a, SEGMENT_SIZE_EXPONENT_MIN) == true);
+	CHECK(arenaSlab_init(&b, SEGMENT_SIZE_EXPONENT_MIN) == true);
+
+	void* slotA = arenaSlab_alloc(&a, 64);
+	CHECK(slotA != NULL);
+
+	CHECK(arenaSlab_which(&b, slotA) == SLAB_LAYER_NONE);
+	CHECK(arenaSlab_usable_size(&b, slotA) == 0);
+	CHECK(arenaSlab_free(&b, slotA) == false);
+	CHECK(arenaSlab_realloc(&b, slotA, 128) == NULL); /* rejected without freeing */
+
+	CHECK(arenaSlab_which(&a, slotA) == SLAB_LAYER_SMALL);
+	CHECK(arenaSlab_free(&a, slotA) == true); /* the true owner still frees it */
+
+	arenaSlab_shutdown(&a);
+	arenaSlab_shutdown(&b);
 }
 
 /* ---- single-segment semantics: 1MB, no growth, exhaustion, revive ---- */
@@ -417,13 +544,17 @@ static void runArenaSlabTests(void) {
 	testDefaultInstance();
 
 	section("class basics (default 4GB segment)");
-	CHECK(arenaSlab_init(&allocator, SEGMENT_SIZE_EXPONENT_DEFAULT) == true);
+	const uint8_t segmentExponent = SEGMENT_SIZE_EXPONENT_DEFAULT;
+	CHECK(arenaSlab_init(&allocator, segmentExponent) == true);
 	testClassBasics(&allocator);
 	testChainReuse(&allocator);
 	testChurn(&allocator);
 	testTrimAndReuse(&allocator);
+	testTrimDroppedHead();
 	testRealloc(&allocator);
-	testForeignPointers(&allocator);
+	testForeignPointers(&allocator, segmentExponent);
+	testInteriorPointerRejection(&allocator);
+	testCrossInstanceIsolation();
 	arenaSlab_shutdown(&allocator);
 
 	testSingleSegmentCapacity();

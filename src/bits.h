@@ -42,16 +42,22 @@ size_t bits_ceil64(uint64_t x);
 )(x)
 #endif
 
-#ifdef __cplusplus
+#if defined(__clang__) || defined(__GNUC__)
+	/* single-instruction inline for GCC/Clang builds; on BMI1 targets tzcnt(0) == 64,
+	 * so the zero guard of ctz/clz folds away entirely (no call, no branch) */
+	static inline size_t bits_popcnt64(uint64_t x) { return (size_t)__builtin_popcountll(x); }
+	static inline size_t bits_ctz64(uint64_t x) { return x ? (size_t)__builtin_ctzll(x) : 64; }
+	static inline size_t bits_clz64(uint64_t x) { return x ? (size_t)__builtin_clzll(x) : 64; }
+#else
+#	ifdef __cplusplus
 extern "C" {
-#endif
-
+#	endif
 	size_t bits_popcnt64(uint64_t x);
 	size_t bits_ctz64(uint64_t x);
 	size_t bits_clz64(uint64_t x);
-
-#ifdef __cplusplus
+#	ifdef __cplusplus
 }
+#	endif
 #endif
 
 #define bits_set_one(value, bitIdx) ((value) |= ((uint64_t)1u << (bitIdx)))

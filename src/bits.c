@@ -66,35 +66,33 @@ size_t bits_ceil64(uint64_t x)
 	return x + 1;
 }
 
+/* popcnt/ctz/clz are static-inlined in bits.h for GCC/Clang builds; the extern
+ * definitions below exist only for compilers without the header inline */
+#if !defined(__clang__) && !defined(__GNUC__)
+
 size_t bits_popcnt64(uint64_t x)
 {
-#if defined(__clang__) || defined(__GNUC__)  
-	// GCC / Clang / Linux / macOS / iOS / Android  
-	return __builtin_popcountll(x);
-#elif defined(_MSC_VER)
+#if defined(_MSC_VER)
 	return __popcnt64(x);
 #else
-	// fallback: portable software implementation  
+	// fallback: portable software implementation
 	x = (x & 0x5555555555555555ULL) + ((x >> 1) & 0x5555555555555555ULL);
 	x = (x & 0x3333333333333333ULL) + ((x >> 2) & 0x3333333333333333ULL);
 	x = (x & 0x0F0F0F0F0F0F0F0FULL) + ((x >> 4) & 0x0F0F0F0F0F0F0F0FULL);
 	x = (x * 0x0101010101010101ULL) >> 56;
 	return x;
-#endif  
+#endif
 }
 
 size_t bits_ctz64(uint64_t x)
 {
-#if defined(__clang__) || defined(__GNUC__)  
-	return x ? __builtin_ctzll(x) : 64;
-#elif defined(_MSC_VER)  
-#include <intrin.h>  
+#if defined(_MSC_VER)
 	unsigned long index;
 	if (_BitScanForward64(&index, x))
 		return index;
 	else
 		return 64;
-#else  
+#else
 	if (x == 0) return 64;
 	uint8_t n = 0;
 	if ((x & 0xFFFFFFFF) == 0) { n += 32; x >>= 32; }
@@ -104,14 +102,12 @@ size_t bits_ctz64(uint64_t x)
 	if ((x & 0x3) == 0) { n += 2; x >>= 2; }
 	if ((x & 0x1) == 0) { n += 1; }
 	return n;
-#endif  
+#endif
 }
 
 size_t bits_clz64(uint64_t x)
 {
-#if defined(__clang__) || defined(__GNUC__)
-	return x ? __builtin_clzll(x) : 64;
-#elif defined(_MSC_VER)
+#if defined(_MSC_VER)
 	unsigned long index;
 	if (_BitScanReverse64(&index, x))
 		return (63 - index);
@@ -134,3 +130,5 @@ size_t bits_clz64(uint64_t x)
 	return n;
 #endif
 }
+
+#endif /* !__clang__ && !__GNUC__ */
