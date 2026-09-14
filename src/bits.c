@@ -8,7 +8,7 @@
 #include <intrin.h> // Ensure this header is included for MSVC intrinsic functions  
 #endif
 
-uint8_t bits_ceil8(uint8_t x)
+size_t bits_ceil8(uint8_t x)
 {
     if (x == 0) return 1;
 
@@ -21,7 +21,7 @@ uint8_t bits_ceil8(uint8_t x)
 	return x + 1;
 }
 
-uint16_t bits_ceil16(uint16_t x)
+size_t bits_ceil16(uint16_t x)
 {
 	if (x == 0) return 1;
 
@@ -35,7 +35,7 @@ uint16_t bits_ceil16(uint16_t x)
 	return x + 1;
 }
 
-uint32_t bits_ceil32(uint32_t x)
+size_t bits_ceil32(uint32_t x)
 {
 	if (x == 0) return 1;
 
@@ -50,7 +50,7 @@ uint32_t bits_ceil32(uint32_t x)
 	return x + 1;
 }
 
-uint64_t bits_ceil64(uint64_t x)
+size_t bits_ceil64(uint64_t x)
 {
 	if (x == 0) return 1;
 
