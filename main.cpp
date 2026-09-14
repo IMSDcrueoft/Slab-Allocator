@@ -2,6 +2,7 @@
 #include <cstdlib>
 #include <chrono>
 #include <vector>
+#include <cassert>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -461,18 +462,58 @@ enum {
 };
 
 /* ---- uniform dispatch layer: one bench implementation, three backends ---- */
+
+/* Size-routing wrapper over a family of FixedAllocators: one instance per 8-byte granular
+ * size (index = (size + 7) >> 3, instance size = index * 8). Routing every request through
+ * it makes the fixed backend pay the same per-call size-routing stage as malloc/arenaSlab —
+ * handing the bench a pre-picked instance would distort the comparison. */
+struct FixedAllocatorRouter {
+	enum { kMaxSize = 256, kSlotCount = (kMaxSize + 7) / 8 + 1 }; /* indices 0..32 */
+
+	slab::FixedAllocator* slots[kSlotCount];
+
+	FixedAllocatorRouter() {
+		for (size_t index = 0; index < kSlotCount; index++) slots[index] = NULL;
+	}
+
+	~FixedAllocatorRouter() {
+		for (size_t index = 0; index < kSlotCount; index++) {
+			delete slots[index];
+		}
+	}
+
+	void* allocate(size_t size) {
+		return instanceFor(size)->allocate();
+	}
+
+	void deallocate(size_t size, void* pointer) {
+		instanceFor(size)->deallocate(pointer);
+	}
+
+private:
+	/* lazy: an instance (and its eager first block) only exists once its size is used */
+	slab::FixedAllocator* instanceFor(size_t size) {
+		assert(size >= 1 && size <= kMaxSize);
+		size_t index = (size + 7) >> 3;
+		if (slots[index] == NULL) {
+			slots[index] = new slab::FixedAllocator(index * 8, 1);
+		}
+		return slots[index];
+	}
+};
+
 typedef struct BenchTarget {
 	void* (*allocate)(void* context, size_t size);
-	void (*deallocate)(void* context, void* pointer);
+	void (*deallocate)(void* context, void* pointer, size_t size);
 	void* context;
 } BenchTarget;
 
 static void* mallocAllocate(void*, size_t size) { return std::malloc(size); }
-static void mallocDeallocate(void*, void* pointer) { std::free(pointer); }
-static void* fixedAllocate(void* context, size_t) { return static_cast<slab::FixedAllocator*>(context)->allocate(); }
-static void fixedDeallocate(void* context, void* pointer) { static_cast<slab::FixedAllocator*>(context)->deallocate(pointer); }
+static void mallocDeallocate(void*, void* pointer, size_t) { std::free(pointer); }
+static void* fixedAllocate(void* context, size_t size) { return static_cast<FixedAllocatorRouter*>(context)->allocate(size); }
+static void fixedDeallocate(void* context, void* pointer, size_t size) { static_cast<FixedAllocatorRouter*>(context)->deallocate(size, pointer); }
 static void* slabAllocate(void* context, size_t size) { return arenaSlab_alloc(static_cast<ArenaSlabAllocator*>(context), size); }
-static void slabDeallocate(void* context, void* pointer) { arenaSlab_free(static_cast<ArenaSlabAllocator*>(context), pointer); }
+static void slabDeallocate(void* context, void* pointer, size_t) { arenaSlab_free(static_cast<ArenaSlabAllocator*>(context), pointer); }
 
 /* one table row: three timings, column order libc malloc / FixedAllocator / arenaSlab */
 static void benchReport3(const char* name, uint64_t operations, const double* seconds) {
@@ -496,7 +537,7 @@ static double benchPatternPair(BenchTarget* target, size_t size, uint64_t operat
 			((unsigned char*)pointer)[0] = 1;
 			sink ^= (uintptr_t)pointer;
 		}
-		target->deallocate(target->context, pointer);
+		target->deallocate(target->context, pointer, size);
 	}
 	benchSink ^= sink;
 	return benchNow() - start;
@@ -518,7 +559,7 @@ static double benchPatternBurst(BenchTarget* target, size_t size, uint32_t count
 		}
 	}
 	for (uint32_t index = 0; index < count; index++) {
-		target->deallocate(target->context, slots[index]);
+		target->deallocate(target->context, slots[index], size);
 	}
 	benchSink ^= sink;
 	return benchNow() - start;
@@ -536,7 +577,7 @@ static double benchPatternChurn(BenchTarget* target, size_t size, uint64_t opera
 		state = state * 6364136223846793005ULL + 1442695040888963407ULL;
 		uint32_t slot = (uint32_t)((state >> 33) & (BENCH_CHURN_SET - 1));
 		if (workingSet[slot] != NULL) {
-			target->deallocate(target->context, workingSet[slot]);
+			target->deallocate(target->context, workingSet[slot], size);
 			workingSet[slot] = NULL;
 		}
 		else {
@@ -551,7 +592,7 @@ static double benchPatternChurn(BenchTarget* target, size_t size, uint64_t opera
 	double seconds = benchNow() - start;
 
 	for (uint32_t slot = 0; slot < BENCH_CHURN_SET; slot++) {
-		if (workingSet[slot] != NULL) target->deallocate(target->context, workingSet[slot]);
+		if (workingSet[slot] != NULL) target->deallocate(target->context, workingSet[slot], size);
 	}
 	benchSink ^= sink;
 	return seconds;
@@ -576,7 +617,7 @@ static double benchPatternMixed(BenchTarget* target, size_t size, uint64_t opera
 		}
 		else {
 			size_t index = (size_t)(((rng.next_u64() & 0xffffffffULL) * slots.size()) >> 32);
-			target->deallocate(target->context, slots[index]);
+			target->deallocate(target->context, slots[index], size);
 			slots[index] = slots.back();
 			slots.pop_back();
 		}
@@ -584,7 +625,7 @@ static double benchPatternMixed(BenchTarget* target, size_t size, uint64_t opera
 	double seconds = benchNow() - start;
 
 	for (size_t index = 0; index < slots.size(); index++) {
-		target->deallocate(target->context, slots[index]);
+		target->deallocate(target->context, slots[index], size);
 	}
 	benchSink ^= sink;
 	return seconds;
@@ -685,16 +726,15 @@ static void runBenchComparison(ArenaSlabAllocator* allocator) {
 
 	printf("  %-30s | ns/op: malloc / fixed / arenaSlab | M ops/s: malloc / fixed / arenaSlab\n", "pattern");
 
+	FixedAllocatorRouter fixedRouter; /* one instance per 8B-granular size, serves all bench sizes */
+
 	BenchTarget targets[3];
 	targets[0].allocate = mallocAllocate; targets[0].deallocate = mallocDeallocate; targets[0].context = NULL;
+	targets[1].allocate = fixedAllocate;  targets[1].deallocate = fixedDeallocate;  targets[1].context = &fixedRouter;
 	targets[2].allocate = slabAllocate;   targets[2].deallocate = slabDeallocate;   targets[2].context = allocator;
 
 	for (size_t index = 0; index < sizeof(sizes) / sizeof(sizes[0]); index++) {
 		const size_t size = sizes[index];
-		slab::FixedAllocator fixed(size, 1);
-		targets[1].allocate = fixedAllocate;
-		targets[1].deallocate = fixedDeallocate;
-		targets[1].context = &fixed;
 
 		snprintf(name, sizeof(name), "pair %zuB", size);
 		for (int t = 0; t < 3; t++) seconds[t] = benchPatternPair(&targets[t], size, BENCH_PATTERN_OPS);
