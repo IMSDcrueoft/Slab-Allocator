@@ -157,6 +157,7 @@
   <ItemGroup>
     <ClCompile Include="main.cpp" />
     <ClCompile Include="src\arena_slab.c" />
+    <ClCompile Include="src\arena_bump.c" />
     <ClCompile Include="src\bits.c" />
     <ClCompile Include="src\palloc_os.c" />
     <ClCompile Include="src\slab.c" />

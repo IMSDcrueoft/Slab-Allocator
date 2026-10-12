@@ -11,6 +11,7 @@
 #endif
 #include "./src/objectPool.hpp"
 #include "./src/arena_slab.h"
+#include "./src/arena_bump.h"
 #include "./src/palloc_os.h"
 
 // Define the maximum number of allocations
@@ -847,6 +848,342 @@ static void runPallocOsProtectTests(void) {
 }
 
 /* ================================================================== */
+/* arenaBump correctness tests (correctness only: the bump hot path   */
+/* is a cursor increment, benchmarks would measure nothing else)      */
+/* ================================================================== */
+
+static void arenaBumpFill(void* p, size_t bytes, uint32_t seed) {
+	uint8_t* b = static_cast<uint8_t*>(p);
+	for (size_t i = 0; i < bytes; i++) b[i] = (uint8_t)(seed + i * 31u);
+}
+
+static bool arenaBumpVerify(const void* p, size_t bytes, uint32_t seed) {
+	const uint8_t* b = static_cast<const uint8_t*>(p);
+	for (size_t i = 0; i < bytes; i++) {
+		if (b[i] != (uint8_t)(seed + i * 31u)) return false;
+	}
+	return true;
+}
+
+static void testArenaBumpInitValidation(void) {
+	section("init validation");
+
+	ArenaBumpAllocator arena;
+	memset(&arena, 0, sizeof(arena));
+
+	CHECK(arenaBump_init(NULL, 1 << 20, false, 8, 0) == false);        /* NULL arena */
+	CHECK(arenaBump_init(&arena, 0, false, 8, 0) == false);            /* zero capacity */
+	CHECK(arenaBump_init(&arena, (1 << 20) + 1, true, 8, 0) == false); /* aligned requires 2^n */
+	CHECK(arenaBump_init(&arena, 1 << 20, false, 24, 0) == false);     /* alignBytes must be 2^n */
+	CHECK(arena.base == NULL);                                         /* failures must not half-initialize */
+
+	/* sub-minimum alignment is raised to the floor, not rejected */
+	CHECK(arenaBump_init(&arena, 1 << 20, false, 4, 0) == true);
+	CHECK(arena.alignBytes == ARENA_BUMP_MIN_ALIGN);
+	CHECK(arenaBump_alloc(&arena, 8) != NULL);
+
+	arenaBump_destroy(&arena);
+}
+
+static void testArenaBumpBasics(void) {
+	section("basics (64KB segment, 16-byte alignment)");
+	const size_t cap = (size_t)64 * 1024;
+
+	ArenaBumpAllocator arena;
+	CHECK(arenaBump_init(&arena, cap, false, 16, 0) == true);
+	CHECK(arenaBump_capacity(&arena) == cap);
+	CHECK(arenaBump_used(&arena) == 0);
+	CHECK(arenaBump_committed(&arena) == 0);
+
+	CHECK(arenaBump_alloc(NULL, 8) == NULL);  /* NULL arena */
+	CHECK(arenaBump_alloc(&arena, 0) == NULL); /* zero bytes */
+
+	uint8_t* a = static_cast<uint8_t*>(arenaBump_alloc(&arena, 100));
+	CHECK(a != NULL && (uintptr_t)a % 16 == 0);
+	arenaBumpFill(a, 100, 1);
+	CHECK(arenaBump_used(&arena) == 100);
+
+	/* alignment gaps are charged to the cursor; no overlap */
+	uint8_t* b = static_cast<uint8_t*>(arenaBump_alloc(&arena, 17));
+	CHECK(b != NULL && (uintptr_t)b % 16 == 0);
+	CHECK(b >= a + 100);
+	CHECK(arenaBump_used(&arena) == (size_t)(b - arena.base) + 17);
+	arenaBumpFill(b, 17, 2);
+	CHECK(arenaBumpVerify(a, 100, 1)); /* neighbour payload intact */
+
+	arenaBump_destroy(&arena);
+
+	/* exact capacity fill, then overflow rejection */
+	ArenaBumpAllocator tight;
+	CHECK(arenaBump_init(&tight, cap, false, 16, 0) == true);
+	CHECK(arenaBump_alloc(&tight, cap) != NULL);
+	CHECK(arenaBump_used(&tight) == cap);
+	CHECK(arenaBump_alloc(&tight, 1) == NULL); /* aligned cursor would cross the end */
+	CHECK(arenaBump_alloc(&tight, 1) == NULL);
+	arenaBump_destroy(&tight);
+}
+
+static void testArenaBumpLazyCommit(void) {
+	section("lazy commit (16MB segment, default 64KB chunks)");
+	const size_t cap = (size_t)16 << 20;
+
+	ArenaBumpAllocator arena;
+	CHECK(arenaBump_init(&arena, cap, false, 8, 0) == true);
+	const size_t chunk = ARENA_BUMP_COMMIT_CHUNK;
+
+	CHECK(arenaBump_alloc(&arena, 16) != NULL);
+	CHECK(arenaBump_committed(&arena) == chunk); /* first touch commits a whole chunk */
+
+	CHECK(arenaBump_alloc(&arena, 1024) != NULL);
+	CHECK(arenaBump_committed(&arena) == chunk); /* under the watermark: no growth */
+
+	CHECK(arenaBump_alloc(&arena, chunk) != NULL); /* spans into the next chunk */
+	CHECK(arenaBump_committed(&arena) >= 2 * chunk);
+	CHECK(arenaBump_committed(&arena) % osPageSize() == 0); /* commit top stays page aligned */
+
+	/* a huge allocation gets its end covered immediately */
+	size_t before = arenaBump_committed(&arena);
+	CHECK(arenaBump_alloc(&arena, (size_t)5 << 20) != NULL);
+	CHECK(arenaBump_committed(&arena) > before);
+	CHECK(arenaBump_committed(&arena) >= arenaBump_used(&arena));
+	CHECK(arenaBump_committed(&arena) % osPageSize() == 0);
+
+	/* rewind never decommits */
+	size_t committed = arenaBump_committed(&arena);
+	size_t mark = arenaBump_mark(&arena);
+	arenaBump_rewind(&arena, mark);
+	CHECK(arenaBump_used(&arena) == mark);
+	CHECK(arenaBump_committed(&arena) == committed);
+
+	arenaBump_destroy(&arena);
+}
+
+static void testArenaBumpMarkRewind(void) {
+	section("mark/rewind (LIFO bulk free)");
+
+	ArenaBumpAllocator arena;
+	CHECK(arenaBump_init(&arena, (size_t)1 << 20, false, 8, 0) == true);
+
+	uint8_t* keeper = static_cast<uint8_t*>(arenaBump_alloc(&arena, 4096));
+	CHECK(keeper != NULL);
+	arenaBumpFill(keeper, 4096, 7);
+
+	size_t outer = arenaBump_mark(&arena);
+
+	uint8_t* first = static_cast<uint8_t*>(arenaBump_alloc(&arena, 512));
+	CHECK(first != NULL);
+	arenaBumpFill(first, 512, 11);
+	size_t inner = arenaBump_mark(&arena);
+	CHECK(inner > outer);
+
+	uint8_t* second = static_cast<uint8_t*>(arenaBump_alloc(&arena, 256));
+	CHECK(second != NULL);
+	CHECK(arenaBump_used(&arena) == 4096 + 512 + 256);
+
+	/* rewind above liveTop is a documented no-op */
+	size_t liveBefore = arenaBump_used(&arena);
+	arenaBump_rewind(&arena, liveBefore + 1);
+	CHECK(arenaBump_used(&arena) == liveBefore);
+
+	arenaBump_rewind(&arena, inner);
+	CHECK(arenaBump_used(&arena) == inner);
+
+	/* the cursor is reused: same address handed out again */
+	uint8_t* reused = static_cast<uint8_t*>(arenaBump_alloc(&arena, 256));
+	CHECK(reused == second);
+	arenaBumpFill(reused, 256, 13);
+
+	arenaBump_rewind(&arena, outer);
+	CHECK(arenaBump_used(&arena) == outer);
+
+	/* payloads below the mark survive the rewind */
+	CHECK(arenaBumpVerify(keeper, 4096, 7));
+
+	/* the space at the mark is handed out again */
+	uint8_t* after = static_cast<uint8_t*>(arenaBump_alloc(&arena, 512));
+	CHECK(after == first);
+
+	arenaBump_destroy(&arena);
+}
+
+static void testArenaBumpShrink(void) {
+	section("shrink (cursor rollback to an allocation boundary)");
+
+	ArenaBumpAllocator arena;
+	CHECK(arenaBump_init(&arena, (size_t)1 << 20, false, 16, 0) == true);
+
+	CHECK(arenaBump_shrink(&arena, NULL) == false);
+
+	uint8_t* a = static_cast<uint8_t*>(arenaBump_alloc(&arena, 128));
+	uint8_t* b = static_cast<uint8_t*>(arenaBump_alloc(&arena, 128));
+	CHECK(a != NULL && b != NULL);
+	size_t usedBoth = arenaBump_used(&arena);
+
+	/* off the alignment grid (8 is not 16-aligned): not an allocation boundary */
+	CHECK(arenaBump_shrink(&arena, a + 8) == false);
+	CHECK(arenaBump_used(&arena) == usedBoth); /* arena unchanged */
+
+	/* outside the live range */
+	CHECK(arenaBump_shrink(&arena, arena.base + arenaBump_capacity(&arena)) == false);
+	int foreign = 0;
+	CHECK(arenaBump_shrink(&arena, &foreign) == false);
+
+	/* valid boundary: back to b, only the last allocation dies */
+	CHECK(arenaBump_shrink(&arena, b) == true);
+	CHECK(arenaBump_used(&arena) == (size_t)(b - arena.base));
+
+	/* the shrunk-away space is handed out again */
+	uint8_t* c = static_cast<uint8_t*>(arenaBump_alloc(&arena, 128));
+	CHECK(c == b);
+
+	/* all the way back to a */
+	CHECK(arenaBump_shrink(&arena, a) == true);
+	CHECK(arenaBump_used(&arena) == (size_t)(a - arena.base));
+
+	arenaBump_destroy(&arena);
+}
+
+static void testArenaBumpOwns(void) {
+	section("owns (range check over the whole reservation)");
+
+	ArenaBumpAllocator arena;
+	CHECK(arenaBump_init(&arena, (size_t)1 << 20, false, 8, 0) == true);
+
+	CHECK(arenaBump_owns(&arena, NULL) == false);
+	CHECK(arenaBump_owns(NULL, arena.base) == false);
+
+	uint8_t* p = static_cast<uint8_t*>(arenaBump_alloc(&arena, 64));
+	CHECK(p != NULL);
+	CHECK(arenaBump_owns(&arena, p) == true);
+	CHECK(arenaBump_owns(&arena, arena.base) == true);
+	CHECK(arenaBump_owns(&arena, arena.base + arenaBump_capacity(&arena) - 1) == true);
+	CHECK(arenaBump_owns(&arena, arena.base + arenaBump_capacity(&arena)) == false); /* one past the end */
+
+	int foreign = 0;
+	CHECK(arenaBump_owns(&arena, &foreign) == false);
+
+	arenaBump_destroy(&arena);
+}
+
+static void testArenaBumpDropReactivation(void) {
+	section("externally dropped tail (osPagesDrop + dropFrom/dropTop)");
+
+	ArenaBumpAllocator arena;
+	CHECK(arenaBump_init(&arena, (size_t)8 << 20, false, 8, 0) == true);
+
+	const size_t pageSize = osPageSize();
+	const size_t payload = (size_t)1 << 20;
+	uint8_t* big = static_cast<uint8_t*>(arenaBump_alloc(&arena, payload));
+	CHECK(big != NULL);
+	arenaBumpFill(big, payload, 5);
+
+	/* rewind everything, then mark the dead tail as dropped (the caller's trim job) */
+	arenaBump_rewind(&arena, 0);
+	size_t dropFrom = pageSize;      /* keep the first page */
+	size_t dropTo = arena.commitTop; /* page-aligned watermark */
+	CHECK(dropTo > dropFrom);
+	if (osPagesDrop(arena.base + dropFrom, dropTo - dropFrom)) {
+		arena.dropFrom = dropFrom;
+		arena.dropTop = dropTo;
+
+		/* the next touching allocation lazily re-commits the dropped pages */
+		uint8_t* again = static_cast<uint8_t*>(arenaBump_alloc(&arena, payload));
+		CHECK(again == big);
+		CHECK(arena.dropFrom >= arena.dropTop); /* tail fully reactivated, marks cleared */
+		arenaBumpFill(again, payload, 6);       /* writable across the old dropped range */
+	}
+
+	arenaBump_destroy(&arena);
+}
+
+static void testArenaBumpDataFuzz(void) {
+	section("randomized LIFO pattern (2k ops, sentinel verification)");
+
+	ArenaBumpAllocator arena;
+	CHECK(arenaBump_init(&arena, (size_t)32 << 20, false, 16, 0) == true);
+
+	struct Live { uint8_t* ptr; size_t bytes; uint32_t seed; };
+	static Live live[64];
+	int liveCount = 0;
+
+	Xorshift64 rng(0xB7B0F001ULL);
+
+	for (int op = 0; op < 2000; op++) {
+		uint64_t roll = rng.next_u64() % 100;
+		if (roll < 70 || liveCount == 0) {
+			/* alloc + fill */
+			size_t bytes = 1 + (size_t)(rng.next_u64() % 8192);
+			uint8_t* p = static_cast<uint8_t*>(arenaBump_alloc(&arena, bytes));
+			if (p == NULL) { CHECK(false); break; } /* 32MB must not exhaust under rewinds */
+			CHECK((uintptr_t)p % 16 == 0);
+			uint32_t seed = (uint32_t)(rng.next_u64() | 1);
+			arenaBumpFill(p, bytes, seed);
+			if (liveCount < 64) {
+				live[liveCount].ptr = p;
+				live[liveCount].bytes = bytes;
+				live[liveCount].seed = seed;
+				liveCount++;
+			}
+		}
+		else if (roll < 90) {
+			/* rewind to a random live boundary: above dies, below survives */
+			int victim = (int)(rng.next_u64() % (uint64_t)liveCount);
+			size_t mark = (size_t)(live[victim].ptr - arena.base);
+			arenaBump_rewind(&arena, mark);
+			CHECK(arenaBump_used(&arena) == mark);
+			for (int i = 0; i < victim; i++) {
+				CHECK(arenaBumpVerify(live[i].ptr, live[i].bytes, live[i].seed));
+			}
+			liveCount = victim;
+		}
+		else {
+			/* full integrity sweep: no overlap, no clobbering */
+			for (int i = 0; i < liveCount; i++) {
+				CHECK(arenaBumpVerify(live[i].ptr, live[i].bytes, live[i].seed));
+			}
+		}
+	}
+
+	arenaBump_destroy(&arena);
+}
+
+static void testArenaBumpDestroyReinit(void) {
+	section("destroy + re-init");
+
+	ArenaBumpAllocator arena;
+	memset(&arena, 0, sizeof(arena));
+	CHECK(arenaBump_init(&arena, (size_t)1 << 20, false, 8, 0) == true);
+	CHECK(arenaBump_alloc(&arena, 128) != NULL);
+
+	arenaBump_destroy(&arena);
+	CHECK(arena.base == NULL);
+	CHECK(arenaBump_capacity(&arena) == 0);
+	CHECK(arenaBump_used(&arena) == 0);
+	CHECK(arenaBump_owns(&arena, nullptr) == false);
+
+	arenaBump_destroy(&arena); /* double destroy must be safe */
+
+	CHECK(arenaBump_init(&arena, (size_t)1 << 20, false, 8, 0) == true); /* re-init after destroy */
+	CHECK(arenaBump_alloc(&arena, 128) != NULL);
+
+	arenaBump_destroy(&arena);
+}
+
+/* ---- runner: all arenaBump correctness tests ---- */
+static void runArenaBumpTests(void) {
+	printf("== arenaBump test suite ==\n");
+	testArenaBumpInitValidation();
+	testArenaBumpBasics();
+	testArenaBumpLazyCommit();
+	testArenaBumpMarkRewind();
+	testArenaBumpShrink();
+	testArenaBumpOwns();
+	testArenaBumpDropReactivation();
+	testArenaBumpDataFuzz();
+	testArenaBumpDestroyReinit();
+}
+
+/* ================================================================== */
 /* arenaSlab benchmarks (merged from test.c)                          */
 /*                                                                     */
 /* Timing uses std::chrono::steady_clock: wall clock, sub-us          */
@@ -1393,6 +1730,9 @@ int main(int argc, char** argv) {
 
 		// palloc_os osPagesProtect tests
 		runPallocOsProtectTests();
+
+		// arenaBump test suite
+		runArenaBumpTests();
 	}
 
 	if (runThroughput) {

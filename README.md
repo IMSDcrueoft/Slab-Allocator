@@ -11,7 +11,7 @@ forcing one general-purpose allocator everywhere.
 |---|---|---|---|
 | **slab** (`FixedAllocator` / `ObjectPool<T>`) | `src/slab.c`, `src/slab.h`, `src/objectPool.hpp` | one fixed unit size per instance, heap-backed | a single hot object type |
 | **arenaSlab** | `src/arena_slab.c`, `src/arena_slab.h` | ≤256B slot classes inside one bounded VA segment | many small objects, deterministic O(1) free, page-level reclamation |
-| **bumpArena** | `src/bumpArena.c`, `src/bumpArena.h` | LIFO scoped scratch space over one VA segment | parsing, compilation, frame-local temporaries |
+| **arenaBump** | `src/arenaBump.c`, `src/arenaBump.h` | LIFO scoped scratch space over one VA segment | parsing, compilation, frame-local temporaries |
 | **palloc_os** | `src/palloc_os.c`, `src/palloc_os.h` | raw kernel VM primitives | the backing layer of the above — or your own allocators |
 | **bits** | `src/bits.c`, `src/bits.h` | ctz/clz/popcnt helpers | shared by the allocators |
 
@@ -132,9 +132,9 @@ arenaSlab_init(&arenaSlabDefault, SEGMENT_SIZE_EXPONENT_DEFAULT);
 
 ---
 
-## bumpArena — LIFO Bump Allocator
+## arenaBump — LIFO Bump Allocator
 
-`src/bumpArena.h` / `src/bumpArena.c` implement a pointer-bump allocator over a `palloc_os`
+`src/arenaBump.h` / `src/arenaBump.c` implement a pointer-bump allocator over a `palloc_os`
 segment: allocate by moving a cursor, free in bulk by rewinding it. Ideal for scoped,
 short-lived memory where everything dies together (parsers, compilers, per-frame work).
 
@@ -156,20 +156,20 @@ short-lived memory where everything dies together (parsers, compilers, per-frame
 ### Usage
 
 ```c
-#include "src/bumpArena.h"
+#include "src/arenaBump.h"
 
-BumpArena arena;
+ArenaBumpAllocator arena;
 /* 1GB reservation, page-aligned base, 16-byte allocations, default commit chunks */
-if (bumpArena_init(&arena, (size_t)1 << 30, false, 16, 0)) {
-    size_t mark = bumpArena_mark(&arena);
+if (arenaBump_init(&arena, (size_t)1 << 30, false, 16, 0)) {
+    size_t mark = arenaBump_mark(&arena);
 
-    void* scratch = bumpArena_alloc(&arena, 4096);
+    void* scratch = arenaBump_alloc(&arena, 4096);
     /* ... use scratch ... */
 
-    bumpArena_rewind(&arena, mark);   /* bulk-free everything since mark */
-    /* or: bumpArena_shrink(&arena, ptr); to trim back to an allocation boundary */
+    arenaBump_rewind(&arena, mark);   /* bulk-free everything since mark */
+    /* or: arenaBump_shrink(&arena, ptr); to trim back to an allocation boundary */
 
-    bumpArena_destroy(&arena);        /* release the reservation */
+    arenaBump_destroy(&arena);        /* release the reservation */
 }
 ```
 
@@ -213,6 +213,6 @@ results should be read with each design's scope in mind:
   only, kernel-VM only, deterministic O(1) free. Trades virtual address space and manual
   `trim` calls for predictability, full-page reclamation and isolation from the libc
   allocator.
-- **bumpArena**: the cheapest possible allocation (cursor bump) with **all-or-nothing**
+- **arenaBump**: the cheapest possible allocation (cursor bump) with **all-or-nothing**
   LIFO lifetime. Per-object frees do not exist; memory is only returned via
   rewind/shrink and explicit page drops. The right tool when allocations share one scope.
