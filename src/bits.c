@@ -72,26 +72,41 @@ size_t bits_ceil64(uint64_t x)
 
 size_t bits_popcnt64(uint64_t x)
 {
-#if defined(_MSC_VER)
+#if defined(_MSC_VER) && defined(_M_X64)
 	return __popcnt64(x);
 #else
-	// fallback: portable software implementation
+	/* portable software implementation: no CPU feature dependency (POPCNT
+	 * requires SSE4.2 hardware; the 32-bit MSVC target has no 64-bit intrinsic) */
 	x = (x & 0x5555555555555555ULL) + ((x >> 1) & 0x5555555555555555ULL);
 	x = (x & 0x3333333333333333ULL) + ((x >> 2) & 0x3333333333333333ULL);
 	x = (x & 0x0F0F0F0F0F0F0F0FULL) + ((x >> 4) & 0x0F0F0F0F0F0F0F0FULL);
 	x = (x * 0x0101010101010101ULL) >> 56;
-	return x;
+	return (size_t)x;
 #endif
 }
 
 size_t bits_ctz64(uint64_t x)
 {
-#if defined(_MSC_VER)
+#if defined(_MSC_VER) && defined(_M_X64)
 	unsigned long index;
 	if (_BitScanForward64(&index, x))
 		return index;
 	else
 		return 64;
+#elif defined(_MSC_VER)
+	/* 32-bit split: _BitScanForward exists on x86 (and ARM); the 64-bit variant does not */
+	unsigned long index;
+	uint32_t low = (uint32_t)x;
+	if (low != 0) {
+		_BitScanForward(&index, low);
+		return (size_t)index;
+	}
+	uint32_t high = (uint32_t)(x >> 32);
+	if (high != 0) {
+		_BitScanForward(&index, high);
+		return (size_t)index + 32;
+	}
+	return 64;
 #else
 	if (x == 0) return 64;
 	uint8_t n = 0;
@@ -107,12 +122,26 @@ size_t bits_ctz64(uint64_t x)
 
 size_t bits_clz64(uint64_t x)
 {
-#if defined(_MSC_VER)
+#if defined(_MSC_VER) && defined(_M_X64)
 	unsigned long index;
 	if (_BitScanReverse64(&index, x))
 		return (63 - index);
 	else
 		return 64;
+#elif defined(_MSC_VER)
+	/* 32-bit split: _BitScanReverse exists on x86 (and ARM); the 64-bit variant does not */
+	unsigned long index;
+	uint32_t high = (uint32_t)(x >> 32);
+	if (high != 0) {
+		_BitScanReverse(&index, high);
+		return 31 - (size_t)index;
+	}
+	uint32_t low = (uint32_t)x;
+	if (low != 0) {
+		_BitScanReverse(&index, low);
+		return 63 - (size_t)index;
+	}
+	return 64;
 #else
 	if (x == 0) return 64;
 	uint8_t n = 0;
