@@ -111,6 +111,25 @@ bool osPagesRecommit(uint8_t *address, size_t length) {
     return VirtualAlloc(address, length, MEM_COMMIT, PAGE_READWRITE) != NULL;
 }
 
+bool osPagesProtect(uint8_t *address, size_t length, OsPageProtection protection) {
+    if (length == 0) return true;
+    if (address == NULL) return false;
+
+    DWORD newProtection;
+    switch (protection) {
+        case OS_PROTECT_NONE: newProtection = PAGE_NOACCESS;           break;
+        case OS_PROTECT_RW:   newProtection = PAGE_READWRITE;          break;
+        case OS_PROTECT_RX:   newProtection = PAGE_EXECUTE_READ;       break;
+        case OS_PROTECT_RWX:  newProtection = PAGE_EXECUTE_READWRITE;  break;
+        default: return false;
+    }
+
+    /* Windows grants EXEC to committed pages at any time (no MAP_JIT equivalent);
+     * pages must be committed or VirtualProtect fails */
+    DWORD oldProtection = 0;
+    return VirtualProtect(address, length, newProtection, &oldProtection) != 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* POSIX: mmap / mprotect / madvise (macOS and Linux share one path)           */
 /* ------------------------------------------------------------------ */
@@ -240,6 +259,48 @@ bool osPagesRecommit(uint8_t *address, size_t length) {
     /* macOS: un-mark purgeable pages first (else the kernel may reclaim them after writes) */
     if (!osPagesReuse(address, length)) return false;
     return osPagesCommit(address, length);
+}
+
+bool osPagesProtect(uint8_t *address, size_t length, OsPageProtection protection) {
+    if (length == 0) return true;
+    if (address == NULL) return false;
+
+    int prot;
+    switch (protection) {
+        case OS_PROTECT_NONE: prot = PROT_NONE;                          break;
+        case OS_PROTECT_RW:   prot = PROT_READ | PROT_WRITE;             break;
+        case OS_PROTECT_RX:   prot = PROT_READ | PROT_EXEC;              break;
+        case OS_PROTECT_RWX:  prot = PROT_READ | PROT_WRITE | PROT_EXEC; break;
+        default: return false;
+    }
+    if (mprotect(address, length, prot) != 0) return false;
+
+#if defined(__APPLE__) && defined(__aarch64__)
+    /*
+     * Apple Silicon userland W^X: MAP_JIT pages are APRR-protected, pure mprotect is not
+     * enough — writes need the per-thread toggle released, execution needs it re-armed.
+     * Weak imports keep binaries linked against older deployment targets loadable; the
+     * toggle is a no-op for non-JIT mappings and harmless on other threads' data pages.
+     */
+    extern void pthread_jit_write_protect_np(int enabled) __attribute__((weak_import));
+    extern int  pthread_jit_write_protect_supported_np(void) __attribute__((weak_import));
+
+    if (&pthread_jit_write_protect_supported_np != NULL && pthread_jit_write_protect_supported_np()) {
+        switch (protection) {
+            case OS_PROTECT_RW:
+            case OS_PROTECT_RWX:
+                pthread_jit_write_protect_np(0); /* writes allowed (code-writing phase) */
+                break;
+            case OS_PROTECT_RX:
+            case OS_PROTECT_NONE:
+                pthread_jit_write_protect_np(1); /* execution only (finalized code) */
+                break;
+            default:
+                break;
+        }
+    }
+#endif
+    return true;
 }
 
 #endif

@@ -39,10 +39,10 @@ bool osSegmentReserve(uint64_t pallocSegmentBytes, uint8_t **outBase, uint8_t **
  *                     *outReserveSize == pallocSegmentBytes.
  * The original osSegmentReserve is kept unchanged for existing callers.
  *
- * executable: the pages may later be granted EXEC permission (machine code).
- * DANGEROUS — handle only trusted, self-generated code. Must be decided at reserve
- * time: Apple Silicon requires MAP_JIT at mmap and it cannot be added afterwards
- * (later EXEC grants happen via protect calls, added separately).
+ * executable: the pages may later be granted EXEC permission via osPagesProtect
+ * (machine code). DANGEROUS — handle only trusted, self-generated code. Must be decided
+ * at reserve time: Apple Silicon requires MAP_JIT at mmap and it cannot be added
+ * afterwards.
  */
 bool osSegmentReserveEx(uint64_t pallocSegmentBytes, bool aligned, bool executable,
                         uint8_t **outBase, uint8_t **outReserveBase, size_t *outReserveSize);
@@ -79,6 +79,29 @@ bool osPagesReuse(uint8_t *address, size_t length);
  * address and length must be aligned to osPageSize().
  */
 bool osPagesRecommit(uint8_t *address, size_t length);
+
+typedef enum OsPageProtection {
+    OS_PROTECT_NONE = 0, /* no access (guard pages)            */
+    OS_PROTECT_RW   = 1, /* read-write                         */
+    OS_PROTECT_RX   = 2, /* read + execute (finalized code)    */
+    OS_PROTECT_RWX  = 3  /* read + write + execute (writing code) */
+} OsPageProtection;
+
+/*
+ * Change the protection of already-committed pages [address, address+length). Pure
+ * permission change: pages must have been committed (osPagesCommit / osPagesRecommit first).
+ * Permissions are NOT sticky: any commit-family call resets pages back to RW, so re-apply
+ * EXEC after every drop/recommit cycle.
+ * Only meaningful for segments reserved with osSegmentReserveEx(executable=true): plain
+ * mappings reject EXEC on Apple Silicon (userland W^X) and are meaningless to execute
+ * elsewhere.
+ * Apple Silicon (macOS arm64): the W^X write toggle (pthread_jit_write_protect_np) is
+ * handled inside — write-capable protections release the toggle, read-only protections
+ * re-arm it. The toggle is per-thread: every thread that writes or runs JIT code must go
+ * through this API on its own.
+ * address and length must be aligned to osPageSize(). Idempotent, repeatable.
+ */
+bool osPagesProtect(uint8_t *address, size_t length, OsPageProtection protection);
 
 /* Runtime page size (macOS arm64 = 16KB, x86-64 = 4KB, Windows follows the system) */
 uint32_t osPageSize(void);
