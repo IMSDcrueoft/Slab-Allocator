@@ -33,6 +33,20 @@ uint32_t osPageSize(void) {
     return (uint32_t)osPageSizeCached;
 }
 
+bool osPageAlloc(uint8_t **outPage, uint32_t *outSize) {
+    uint32_t size = osPageSize();
+    uint8_t *page = (uint8_t *)VirtualAlloc(NULL, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (page == NULL) return false;
+    if (outPage != NULL) *outPage = page;
+    if (outSize != NULL) *outSize = size;
+    return true;
+}
+
+void osPageFree(uint8_t *page, uint32_t size) {
+    (void)size;
+    if (page != NULL) VirtualFree(page, 0, MEM_RELEASE);
+}
+
 /*
  * Windows VirtualAlloc has 64KB allocation granularity only, no alignment parameter, and MEM_RELEASE
  * releases a reservation only as a whole. So we over-reserve 8GB (4GB segment + up to 4GB
@@ -51,6 +65,20 @@ bool osSegmentReserve(uint64_t pallocSegmentBytes, uint8_t **outBase, uint8_t **
     *outReserveBase = rawBase;
     *outReserveSize = overReserveSize;
     return true;
+}
+
+bool osSegmentReserveEx(uint64_t pallocSegmentBytes, bool aligned, bool executable, uint8_t **outBase, uint8_t **outReserveBase, size_t *outReserveSize) {
+    /* Windows grants EXEC later via VirtualProtect(PAGE_EXECUTE_*); nothing to do at reserve */
+    (void)executable;
+    if (!aligned) {
+        uint8_t *base = (uint8_t *)VirtualAlloc(NULL, (size_t)pallocSegmentBytes, MEM_RESERVE, PAGE_NOACCESS);
+        if (base == NULL) return false;
+        *outBase = base;
+        *outReserveBase = base;
+        *outReserveSize = (size_t)pallocSegmentBytes;
+        return true;
+    }
+    return osSegmentReserve(pallocSegmentBytes, outBase, outReserveBase, outReserveSize);
 }
 
 void osSegmentRelease(uint8_t *reserveBase, size_t reserveSize) {
@@ -76,6 +104,13 @@ bool osPagesReuse(uint8_t *address, size_t length) {
     return true; /* Windows MEM_RESET pages need no unmarking */
 }
 
+bool osPagesRecommit(uint8_t *address, size_t length) {
+    if (length == 0) return true;
+    if (address == NULL) return false;
+    /* no reuse mark to clear on Windows: (re)committing is enough */
+    return VirtualAlloc(address, length, MEM_COMMIT, PAGE_READWRITE) != NULL;
+}
+
 /* ------------------------------------------------------------------ */
 /* POSIX: mmap / mprotect / madvise (macOS and Linux share one path)           */
 /* ------------------------------------------------------------------ */
@@ -94,14 +129,48 @@ uint32_t osPageSize(void) {
     return (uint32_t)osPageSizeCached;
 }
 
+bool osPageAlloc(uint8_t **outPage, uint32_t *outSize) {
+    uint32_t size = osPageSize();
+    void *page = mmap(NULL, size, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (page == MAP_FAILED) return false;
+    if (outPage != NULL) *outPage = (uint8_t *)page;
+    if (outSize != NULL) *outSize = size;
+    return true;
+}
+
+void osPageFree(uint8_t *page, uint32_t size) {
+    if (page != NULL && size > 0) munmap(page, size);
+}
+
 /*
  * POSIX mmap has no alignment parameter: over-reserve 8GB, then munmap the head and
  * tail outside the aligned 4GB window; the segment ends up exactly 4GB of VA, no waste.
+ *
+ * executable: Apple Silicon enforces userland W^X — EXEC can only be granted to
+ * MAP_JIT mappings, and MAP_JIT must be passed at mmap time. Other platforms grant
+ * EXEC later via mprotect, so the flag is a no-op there.
  */
-bool osSegmentReserve(uint64_t pallocSegmentBytes, uint8_t **outBase, uint8_t **outReserveBase, size_t *outReserveSize) {
+static bool osSegmentReserveImpl(uint64_t pallocSegmentBytes, bool aligned, bool executable,
+                                 uint8_t **outBase, uint8_t **outReserveBase, size_t *outReserveSize) {
+    int mmapFlags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (executable) mmapFlags |= MAP_JIT;
+#else
+    (void)executable;
+#endif
+
+    if (!aligned) {
+        void *rawBase = mmap(NULL, (size_t)pallocSegmentBytes, PROT_NONE, mmapFlags, -1, 0);
+        if (rawBase == MAP_FAILED) return false;
+        *outBase = (uint8_t *)rawBase;
+        *outReserveBase = (uint8_t *)rawBase;
+        *outReserveSize = (size_t)pallocSegmentBytes;
+        return true;
+    }
+
     const size_t overReserveSize = (size_t)pallocSegmentBytes * 2;
-    void *rawBase = mmap(NULL, overReserveSize, PROT_NONE,
-                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    void *rawBase = mmap(NULL, overReserveSize, PROT_NONE, mmapFlags, -1, 0);
     if (rawBase == MAP_FAILED) return false;
 
     uintptr_t rawAddress = (uintptr_t)rawBase;
@@ -120,6 +189,14 @@ bool osSegmentReserve(uint64_t pallocSegmentBytes, uint8_t **outBase, uint8_t **
     *outReserveBase = (uint8_t *)alignedAddress;
     *outReserveSize = (size_t)pallocSegmentBytes;
     return true;
+}
+
+bool osSegmentReserve(uint64_t pallocSegmentBytes, uint8_t **outBase, uint8_t **outReserveBase, size_t *outReserveSize) {
+    return osSegmentReserveImpl(pallocSegmentBytes, true, false, outBase, outReserveBase, outReserveSize);
+}
+
+bool osSegmentReserveEx(uint64_t pallocSegmentBytes, bool aligned, bool executable, uint8_t **outBase, uint8_t **outReserveBase, size_t *outReserveSize) {
+    return osSegmentReserveImpl(pallocSegmentBytes, aligned, executable, outBase, outReserveBase, outReserveSize);
 }
 
 void osSegmentRelease(uint8_t *reserveBase, size_t reserveSize) {
@@ -155,6 +232,14 @@ bool osPagesReuse(uint8_t *address, size_t length) {
     (void)length;
     return true;
 #endif
+}
+
+bool osPagesRecommit(uint8_t *address, size_t length) {
+    if (length == 0) return true;
+    if (address == NULL) return false;
+    /* macOS: un-mark purgeable pages first (else the kernel may reclaim them after writes) */
+    if (!osPagesReuse(address, length)) return false;
+    return osPagesCommit(address, length);
 }
 
 #endif

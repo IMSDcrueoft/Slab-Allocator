@@ -30,6 +30,23 @@ extern "C" {
  */
 bool osSegmentReserve(uint64_t pallocSegmentBytes, uint8_t **outBase, uint8_t **outReserveBase, size_t *outReserveSize);
 
+/*
+ * Like osSegmentReserve, but with an optional power-of-two alignment toggle.
+ *   aligned == true : *outBase is aligned to pallocSegmentBytes (pallocSegmentBytes must be a
+ *                     power of two); on the Windows over-reservation path *outReserveBase /
+ *                     *outReserveSize describe the real base and size needed for release.
+ *   aligned == false: plain page-aligned reservation; *outReserveBase == *outBase and
+ *                     *outReserveSize == pallocSegmentBytes.
+ * The original osSegmentReserve is kept unchanged for existing callers.
+ *
+ * executable: the pages may later be granted EXEC permission (machine code).
+ * DANGEROUS — handle only trusted, self-generated code. Must be decided at reserve
+ * time: Apple Silicon requires MAP_JIT at mmap and it cannot be added afterwards
+ * (later EXEC grants happen via protect calls, added separately).
+ */
+bool osSegmentReserveEx(uint64_t pallocSegmentBytes, bool aligned, bool executable,
+                        uint8_t **outBase, uint8_t **outReserveBase, size_t *outReserveSize);
+
 /* Release the whole reservation (must pass the reserveBase/reserveSize from osSegmentReserve) */
 void osSegmentRelease(uint8_t *reserveBase, size_t reserveSize);
 
@@ -55,8 +72,26 @@ bool osPagesDrop(uint8_t *address, size_t length);
  */
 bool osPagesReuse(uint8_t *address, size_t length);
 
+/*
+ * Make [address, address+length) usable again before writing to it. Encapsulates the
+ * macOS requirement that MADV_FREE_REUSABLE pages must be un-marked (MADV_FREE_REUSE)
+ * before reuse; on Linux/Windows this is just a (re)commit. Idempotent.
+ * address and length must be aligned to osPageSize().
+ */
+bool osPagesRecommit(uint8_t *address, size_t length);
+
 /* Runtime page size (macOS arm64 = 16KB, x86-64 = 4KB, Windows follows the system) */
 uint32_t osPageSize(void);
+
+/*
+ * Allocate exactly one OS page as read-write, committed memory, independent of any
+ * segment. On success *outPage receives the page base and *outSize receives osPageSize().
+ * Returns false on failure.
+ */
+bool osPageAlloc(uint8_t **outPage, uint32_t *outSize);
+
+/* Release a page previously returned by osPageAlloc (pass back the same size). */
+void osPageFree(uint8_t *page, uint32_t size);
 
 #ifdef __cplusplus
 }
