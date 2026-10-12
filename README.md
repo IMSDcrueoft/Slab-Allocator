@@ -1,14 +1,23 @@
-# Slab Allocator
-A high-performance single-thread memory allocator using slab allocation technique, designed for efficient fixed-size memory allocations.
+# memAllocator
 
-## Features
+A single-threaded memory allocator toolkit — not one allocator, but a collection of
+independently usable components built around a shared kernel-VM primitive layer. Each
+component makes a different trade-off; pick the one that fits the workload instead of
+forcing one general-purpose allocator everywhere.
 
-- **Api**: Provides both C and CPP interfaces
-- **Slab-based allocation**: Organizes memory into slabs containing fixed-size units
-- **Fast allocation/deallocation**: O(1) average case performance for both operations
-- **Memory efficiency**: Minimizes fragmentation through fixed-size blocks
-- **Automatic slab management**: Creates new slabs when needed and reclaims empty ones
-- **Debug support**: Includes extensive error checking and statistics reporting
+## Components
+
+| Component | Files | Scope | Best for |
+|---|---|---|---|
+| **slab** (`FixedAllocator` / `ObjectPool<T>`) | `src/slab.c`, `src/slab.h`, `src/objectPool.hpp` | one fixed unit size per instance, heap-backed | a single hot object type |
+| **arenaSlab** | `src/arena_slab.c`, `src/arena_slab.h` | ≤256B slot classes inside one bounded VA segment | many small objects, deterministic O(1) free, page-level reclamation |
+| **bumpArena** | `src/bumpArena.c`, `src/bumpArena.h` | LIFO scoped scratch space over one VA segment | parsing, compilation, frame-local temporaries |
+| **palloc_os** | `src/palloc_os.c`, `src/palloc_os.h` | raw kernel VM primitives | the backing layer of the above — or your own allocators |
+| **bits** | `src/bits.c`, `src/bits.h` | ctz/clz/popcnt helpers | shared by the allocators |
+
+All components are single-threaded and lock-free by design. The C components expose
+`extern "C"` interfaces. `main.cpp` drives the whole toolkit through one correctness test
+suite and one benchmark harness (`memAllocator.exe [--test | --bench]`).
 
 ## License
 
@@ -16,70 +25,56 @@ MIT License
 
 See [LICENSE](LICENSE) file for full license text.
 
-## Implementation Details
+---
 
-### Key Components
+## slab — FixedAllocator / ObjectPool (C++)
 
-1. **SlabUnit**:
-   - Represents an individual allocation unit
-   - Contains metadata (index and offset) and payload space
-   - Provides conversion between unit and payload pointers
+The original slab allocator: memory is organized into slabs of fixed-size units, tracked
+with 64-bit bitmaps. The C++ wrapper (`objectPool.hpp`) comes in two flavors:
 
-2. **SlabBlock**:
-   - Manages a block of 64 units
-   - Uses bitmaps to track free/allocated units
-   - Implements unit allocation and block creation/destruction
-   - Maintains linked list connections
+- `slab::FixedAllocator` — raw fixed-size units, for advanced users who manage
+  construction/destruction themselves.
+- `slab::ObjectPool<T>` — typed pool that constructs/destructs `T` in place
+  (`sizeof(T)` is the unit size).
 
-3. **SlabAllocator**:
-   - Main allocator class managing multiple slabs
-   - Handles memory allocation and deallocation requests
-   - Manages slab creation and reclamation
-   - Maintains cache optimization
+### Implementation Details
+
+1. **SlabUnit**: an individual allocation unit; carries metadata (index and offset) plus
+   payload; converts between unit and payload pointers.
+2. **SlabBlock**: manages a block of 64 units via a 64-bit free bitmap; implements unit
+   allocation and block creation/destruction; maintains list connections.
+3. **SlabAllocator**: the main allocator class; routes alloc/free requests, creates and
+   reclaims slabs, keeps a cache of hot blocks.
 
 ### Technical Specifications
 
 - Fixed unit sizes (configurable at creation, up to 1024 bytes)
-- 64 units per slab block
-- Bitmap-based free unit tracking (64-bit)
-- Automatic slab creation when needed
-- Intelligent slab reclamation when empty
-- Reduce traversal overhead
-- Memory alignment to 8-byte boundaries
+- 64 units per slab block, bitmap-based free tracking (64-bit)
+- 8-byte alignment; O(1) average-case alloc/free
+- "full" + "work" lists minimize traversal; empty slabs beyond the reserved limit are
+  destroyed automatically
+- Unbounded growth through the pluggable backend (the C++ wrapper uses the heap)
 
-## Usage
-
-### Basic Operations
+### Usage
 
 ```cpp
 #include "./src/objectPool.hpp"
-// Create an allocator for 256-byte units
+
+// one allocator per unit size (reserved_limit = warm spare slabs kept after free)
 slab::FixedAllocator allocator(256);
 
-// Allocate memory
-void* ptr1 = allocator.allocate();
-void* ptr2 = allocator.allocate();
+void* p1 = allocator.allocate();
+void* p2 = allocator.allocate();
+allocator.deallocate(p1);
+allocator.deallocate(p2);
 
-// Use the memory
-int* data1 = static_cast<int*>(ptr1);
-*data1 = 42;
-
-// Deallocate memory
-allocator.deallocate(ptr1);
-allocator.deallocate(ptr2);
-
-// Get statistics
-std::cout << "Total slabs: " << allocator.total() << std::endl;
-std::cout << "Reserved slabs: " << allocator.reserved() << std::endl;
-
-// Print detailed statistics
-allocator.print_stats();
+// typed pool: constructs/destructs T in place
+slab::ObjectPool<MyType> pool;
+MyType* obj = pool.allocate(1, 2, 3);   /* forwards constructor args */
+pool.deallocate(obj);
 ```
 
-## Performance Considerations
-
-- The allocator maintains a "full" and a "work" list to minimize traversal
-- Empty slabs beyond the reserved limit are automatically destroyed
+---
 
 ## arenaSlab — Single-Segment Small-Object Allocator
 
@@ -87,8 +82,7 @@ allocator.print_stats();
 small objects (≤ 256 bytes). It sits on top of raw kernel VM primitives
 (`src/palloc_os.c`: `mmap`/`mprotect`/`madvise` on POSIX, `VirtualAlloc`/`VirtualFree` on
 Windows) — no libc allocator is involved. The bit-manipulation helpers (`src/bits.h`,
-`src/bits.c`: ctz/clz/popcnt) are taken from Slab-Allocator (MIT License, Copyright (c) 2026
-IMSDcrueoft).
+`src/bits.c`: ctz/clz/popcnt) are shared.
 
 ### Design Highlights
 
@@ -136,11 +130,79 @@ if (arenaSlab_init(&allocator, SEGMENT_SIZE_EXPONENT_DEFAULT)) {   /* 4GB */
 arenaSlab_init(&arenaSlabDefault, SEGMENT_SIZE_EXPONENT_DEFAULT);
 ```
 
-### Trade-offs
+---
 
-The three allocators in this repo make fundamentally different trade-offs and are not
-drop-in replacements for one another. `main.cpp` runs them through the same load patterns,
-but the results should be read with each design's scope in mind:
+## bumpArena — LIFO Bump Allocator
+
+`src/bumpArena.h` / `src/bumpArena.c` implement a pointer-bump allocator over a `palloc_os`
+segment: allocate by moving a cursor, free in bulk by rewinding it. Ideal for scoped,
+short-lived memory where everything dies together (parsers, compilers, per-frame work).
+
+### Design Highlights
+
+- **VA reserved once, never moves**; memory is committed lazily in `commitChunkSize` steps
+  (default 16KB, rounded to page size), so capacity costs virtual address space only.
+- **O(1) alloc**: alignment (configurable, 2^n, ≥ 8) + capacity check + cursor bump.
+- **LIFO release**: `mark`/`rewind` restores a saved cursor; `shrink(ptr)` makes any
+  allocation boundary the new top. There is no per-object free by design.
+- **Page trimming is the caller's job**: mark the dead tail with
+  `osPagesDrop` + `dropFrom/dropTop`; the arena re-commits those pages lazily on the next
+  touching allocation.
+- **Failure semantics**: `alloc` returns `NULL` on overflow, capacity exceeded, or commit
+  failure; `shrink` rejects pointers outside `[base, base+used)` or off the alignment grid
+  (arena unchanged).
+- Query helpers: `used` / `capacity` / `committed` / `owns`.
+
+### Usage
+
+```c
+#include "src/bumpArena.h"
+
+BumpArena arena;
+/* 1GB reservation, page-aligned base, 16-byte allocations, default commit chunks */
+if (bumpArena_init(&arena, (size_t)1 << 30, false, 16, 0)) {
+    size_t mark = bumpArena_mark(&arena);
+
+    void* scratch = bumpArena_alloc(&arena, 4096);
+    /* ... use scratch ... */
+
+    bumpArena_rewind(&arena, mark);   /* bulk-free everything since mark */
+    /* or: bumpArena_shrink(&arena, ptr); to trim back to an allocation boundary */
+
+    bumpArena_destroy(&arena);        /* release the reservation */
+}
+```
+
+---
+
+## palloc_os — Kernel VM Primitives
+
+`src/palloc_os.h` / `src/palloc_os.c` expose raw reservation / commit / drop / protect
+primitives and nothing else — no allocator logic. Everything above is built on this layer.
+
+- **Segments**: `osSegmentReserve` (power-of-two aligned reservation), `osSegmentReserveEx`
+  (plain page-aligned optional, `executable` flag for JIT-ready memory — required at
+  reserve time for Apple Silicon `MAP_JIT`), `osSegmentRelease`.
+- **Pages**: `osPagesCommit` (RW), `osPagesDrop` (macOS purgeable / Linux `MADV_DONTNEED` /
+  Windows `MEM_RESET`), `osPagesReuse`, `osPagesRecommit` (encapsulates the macOS
+  reusable/reuse dance), `osPagesProtect` (NONE / RW / RX / RWX).
+- **W^X / code pages**: `osPagesProtect` grants EXEC via `VirtualProtect`/`mprotect`; on
+  Apple Silicon the per-thread write toggle (`pthread_jit_write_protect_np`) is handled
+  inside — write-capable protections release it, read-only ones re-arm it. Permissions are
+  not sticky: commit-family calls reset pages to RW, re-apply EXEC afterwards.
+- **Standalone pages**: `osPageAlloc` / `osPageFree` (one committed OS page, independent of
+  any segment), `osPageSize` (runtime page size: 16KB macOS arm64, 4KB x86-64, Windows
+  follows the system).
+- Platform backends: macOS/Linux `mmap` + `mprotect` + `madvise`; Windows
+  `VirtualAlloc` / `VirtualProtect` / `VirtualFree`.
+
+---
+
+## Trade-offs
+
+The allocators in this repo make fundamentally different trade-offs and are not drop-in
+replacements for one another. `main.cpp` runs them through the same load patterns, but the
+results should be read with each design's scope in mind:
 
 - **libc malloc**: general-purpose — any size, thread-safe, reclaims memory on its own
   terms. Pays for that generality on the hot path and always involves the CRT heap.
@@ -151,3 +213,6 @@ but the results should be read with each design's scope in mind:
   only, kernel-VM only, deterministic O(1) free. Trades virtual address space and manual
   `trim` calls for predictability, full-page reclamation and isolation from the libc
   allocator.
+- **bumpArena**: the cheapest possible allocation (cursor bump) with **all-or-nothing**
+  LIFO lifetime. Per-object frees do not exist; memory is only returned via
+  rewind/shrink and explicit page drops. The right tool when allocations share one scope.

@@ -22,7 +22,7 @@
     <VCProjectVersion>17.0</VCProjectVersion>
     <Keyword>Win32Proj</Keyword>
     <ProjectGuid>{f3edc93b-fbd2-429c-ac90-2ba5f0bb1c4d}</ProjectGuid>
-    <RootNamespace>slabAlloc</RootNamespace>
+    <RootNamespace>memAllocator</RootNamespace>
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />

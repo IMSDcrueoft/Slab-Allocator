@@ -6,6 +6,9 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#ifdef _WIN32
+#include <excpt.h> /* SEH probes only; windows.h would poison the 'small' identifier (rpcndr.h) */
+#endif
 #include "./src/objectPool.hpp"
 #include "./src/arena_slab.h"
 #include "./src/palloc_os.h"
@@ -764,6 +767,86 @@ static void runArenaSlabTests(void) {
 }
 
 /* ================================================================== */
+/* palloc_os: osPagesProtect (EXEC grant / W^X hardening)             */
+/* ================================================================== */
+
+#if defined(_M_X64) || defined(__x86_64__)
+static void testPagesProtectExec(void) {
+	section("osPagesProtect: RWX write -> RX execute (x64 machine code)");
+
+	uint8_t* page = NULL;
+	uint32_t size = 0;
+	CHECK(osPageAlloc(&page, &size) == true);
+	if (page == NULL) return; /* no further checks without the page */
+
+	/* x64: mov eax,42; ret — return value carried in eax */
+	static const uint8_t machineCode[] = { 0xB8, 0x2A, 0x00, 0x00, 0x00, 0xC3 };
+
+	CHECK(osPagesProtect(page, size, OS_PROTECT_RWX) == true);
+	memcpy(page, machineCode, sizeof(machineCode));
+	CHECK(osPagesProtect(page, size, OS_PROTECT_RX) == true);
+
+	typedef int (*Ret42Fn)(void);
+	CHECK(reinterpret_cast<Ret42Fn>(page)() == 42);
+
+#ifdef _WIN32
+	/* RX must refuse writes (DEP enforces PAGE_EXECUTE_READ) */
+	{
+		bool writeFaulted = false;
+		__try {
+			page[0] = 0x90;
+		}
+		__except (GetExceptionCode() == 0xC0000005u /* EXCEPTION_ACCESS_VIOLATION (winnt.h) */
+			? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+			writeFaulted = true;
+		}
+		CHECK(writeFaulted == true);
+	}
+#endif
+
+	/* documented non-sticky behavior: recommit resets protection to RW; rewrite the
+	 * full payload (patching byte 0 would just misalign the instruction stream) */
+	CHECK(osPagesRecommit(page, size) == true);
+	memcpy(page, machineCode, sizeof(machineCode));
+	CHECK(osPagesProtect(page, size, OS_PROTECT_RX) == true);
+	CHECK(reinterpret_cast<Ret42Fn>(page)() == 42);
+
+	/* NONE turns the page into a guard page: reads fault */
+	CHECK(osPagesProtect(page, size, OS_PROTECT_NONE) == true);
+#ifdef _WIN32
+	{
+		bool readFaulted = false;
+		__try {
+			volatile uint8_t probe = page[0];
+			(void)probe;
+		}
+		__except (GetExceptionCode() == 0xC0000005u /* EXCEPTION_ACCESS_VIOLATION (winnt.h) */
+			? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+			readFaulted = true;
+		}
+		CHECK(readFaulted == true);
+	}
+#endif
+
+	osPageFree(page, size); /* release works regardless of the last protection */
+}
+#endif /* x64 */
+
+static void runPallocOsProtectTests(void) {
+	printf("== palloc_os osPagesProtect test suite ==\n");
+
+	section("argument validation");
+	CHECK(osPagesProtect(NULL, 4096, OS_PROTECT_RW) == false);
+	CHECK(osPagesProtect(reinterpret_cast<uint8_t*>(&testFailures), 0, OS_PROTECT_RWX) == true);
+
+#if defined(_M_X64) || defined(__x86_64__)
+	testPagesProtectExec();
+#else
+	section("exec path skipped (non-x64 build)");
+#endif
+}
+
+/* ================================================================== */
 /* arenaSlab benchmarks (merged from test.c)                          */
 /*                                                                     */
 /* Timing uses std::chrono::steady_clock: wall clock, sub-us          */
@@ -1307,6 +1390,9 @@ int main(int argc, char** argv) {
 
 		// arenaSlab test suite
 		runArenaSlabTests();
+
+		// palloc_os osPagesProtect tests
+		runPallocOsProtectTests();
 	}
 
 	if (runThroughput) {
