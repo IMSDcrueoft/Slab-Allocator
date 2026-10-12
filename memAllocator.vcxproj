@@ -163,6 +163,7 @@
     <ClCompile Include="src\slab.c" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="src\arena_bump.h" />
     <ClInclude Include="src\arena_slab.h" />
     <ClInclude Include="src\bits.h" />
     <ClInclude Include="src\palloc_os.h" />
