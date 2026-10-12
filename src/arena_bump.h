@@ -64,6 +64,11 @@ void   arenaBump_rewind(ArenaBumpAllocator *arena, size_t mark);
  * [base, base + used] or not alignBytes-aligned. */
 bool arenaBump_shrink(ArenaBumpAllocator *arena, const void *ptr);
 
+/* Commits pages until the byte range [0, byteEnd) is backed; reactivates
+ * externally dropped pages in the way. Does NOT move liveTop. byteEnd is
+ * clamped to capacity. Returns false on commit failure. */
+bool arenaBump_ensureCommitted(ArenaBumpAllocator *arena, size_t byteEnd);
+
 size_t arenaBump_used(const ArenaBumpAllocator *arena);       /* liveTop   */
 size_t arenaBump_capacity(const ArenaBumpAllocator *arena);   /* capacity  */
 size_t arenaBump_committed(const ArenaBumpAllocator *arena);  /* commitTop */

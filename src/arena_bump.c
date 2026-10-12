@@ -124,6 +124,12 @@ bool arenaBump_shrink(ArenaBumpAllocator *arena, const void *ptr) {
     return true;
 }
 
+bool arenaBump_ensureCommitted(ArenaBumpAllocator *arena, size_t byteEnd) {
+    if (arena == NULL || arena->base == NULL) return false;
+    if (byteEnd > arena->capacity) byteEnd = arena->capacity;
+    return arenaBumpEnsure(arena, byteEnd);
+}
+
 size_t arenaBump_used(const ArenaBumpAllocator *arena) {
     return arena ? arena->liveTop : 0;
 }
